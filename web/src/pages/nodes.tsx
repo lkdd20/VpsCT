@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Plus, Upload, Trash2, Pencil, QrCode, RotateCcw, Search, GripVertical, Link2, Unlink, ArrowRightLeft } from "lucide-react";
 import { DndContext, closestCenter, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
@@ -6,9 +7,10 @@ import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } 
 import { CSS } from "@dnd-kit/utilities";
 import { del, get, post, put } from "@/lib/api";
 import type { Node, Series } from "@/lib/types";
-import { copyText, fmtDate, PROTOCOL_LABELS, cn } from "@/lib/utils";
+import { copyText, fmtBytes, fmtDate, PROTOCOL_LABELS, cn } from "@/lib/utils";
 import { Badge, Button, Confirm, Dialog, Empty, Field, Input, PageHeader, Select, Spinner, Switch, Table, Td, Th, Tr, Textarea, Pre, Tabs, Code } from "@/components/ui";
 import { useToast } from "@/components/toast";
+import { TrafficIO } from "@/components/traffic-ways";
 import { TrafficBars } from "@/components/charts";
 
 export function ProtocolBadge({ p }: { p: string }) {
@@ -23,7 +25,7 @@ export function SourceBadge({ n }: { n: Node }) {
   return <Badge variant="secondary">手动</Badge>;
 }
 
-export function NodeRow({ n, onOpen, selectable, selected, onSelect, dragHandle, rowRef, style }: { n: Node; onOpen: () => void; selectable?: boolean; selected?: boolean; onSelect?: (v: boolean) => void; dragHandle?: React.ReactNode; rowRef?: (el: HTMLTableRowElement | null) => void; style?: React.CSSProperties }) {
+export function NodeRow({ n, onOpen, selectable, selected, onSelect, dragHandle, rowRef, style, configurationHint }: { configurationHint?: string; n: Node; onOpen: () => void; selectable?: boolean; selected?: boolean; onSelect?: (v: boolean) => void; dragHandle?: React.ReactNode; rowRef?: (el: HTMLTableRowElement | null) => void; style?: React.CSSProperties }) {
   return (
     <Tr ref={rowRef} style={style} className={cn(n.revoked && "opacity-50", "cursor-pointer")} onClick={onOpen}>
       {selectable && (
@@ -40,7 +42,8 @@ export function NodeRow({ n, onOpen, selectable, selected, onSelect, dragHandle,
       <Td><ProtocolBadge p={n.protocol} /></Td>
       <Td className="mono text-xs text-muted-foreground">{n.server || "—"}:{n.port}</Td>
       <Td><SourceBadge n={n} /></Td>
-      <Td>{n.revoked ? <Badge variant="destructive">已撤销</Badge> : n.enabled ? <Badge variant="success">启用</Badge> : <Badge variant="secondary">禁用</Badge>}</Td>
+      <Td>{n.source !== "deployed" ? <span className="text-xs text-muted-foreground">不可采集</span> : !n.traffic ? <span className="text-xs text-muted-foreground">暂不可用</span> : !n.traffic.has_data ? <span className="text-xs text-muted-foreground">暂无采集记录</span> : <div><p className="tabular-nums font-medium">{fmtBytes(n.traffic.total)}</p><p className="text-xs text-muted-foreground">入 {fmtBytes(n.traffic.inbound)} · 出 {fmtBytes(n.traffic.outbound)}</p></div>}</Td>
+      <Td>{configurationHint && <p className="mb-1 max-w-48 text-xs text-amber-600">{configurationHint} · 见服务器提示</p>}{n.revoked ? <Badge variant="destructive">已撤销</Badge> : n.enabled ? <Badge variant="success">启用</Badge> : <Badge variant="secondary">禁用</Badge>}</Td>
       <Td className="text-right" onClick={(e) => e.stopPropagation()}>
         {n.uri && (
           <Button size="icon" variant="ghost" title="复制链接" onClick={async () => { await copyText(n.uri!); }}>
@@ -74,6 +77,8 @@ export function NodesPage() {
   const toast = useToast();
   const [source, setSource] = React.useState<"" | Node["source"]>("");
   const [q, setQ] = React.useState("");
+ const [serverFilter,setServerFilter]=React.useState("");
+ const [sortUsage,setSortUsage]=React.useState(false);
   const [showRevoked, setShowRevoked] = React.useState(false);
   const nodes = useQuery({ queryKey: ["nodes", { source, showRevoked }], queryFn: () => get<Node[]>(`/api/v1/nodes?source=${source}${showRevoked ? "&include_revoked=1" : ""}`) });
   const [order, setOrder] = React.useState<Node[]>([]);
@@ -84,6 +89,8 @@ export function NodesPage() {
   const [detail, setDetail] = React.useState<Node | null>(null);
   const [confirmBulk, setConfirmBulk] = React.useState(false);
   const [chainOpen, setChainOpen] = React.useState(false);
+  const [resetNodes, setResetNodes] = React.useState<Node[] | null>(null);
+  const resettable = order.filter((n) => selected.has(n.id) && n.source === "deployed" && n.server_id && !n.revoked);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
   const reorder = useMutation({ mutationFn: (ids: number[]) => post("/api/v1/nodes/reorder", { ids }), onError: (e) => toast.fromError(e) });
@@ -102,8 +109,10 @@ export function NodesPage() {
     onError: (e) => toast.fromError(e),
   });
 
-  const filtered = order.filter((n) => !q || n.name.toLowerCase().includes(q.toLowerCase()) || n.server.includes(q) || n.protocol.includes(q));
-  const canDrag = !q && source !== "";
+  const filtered = order.filter((n) => (!serverFilter || String(n.server_id)===serverFilter) && (!q || n.name.toLowerCase().includes(q.toLowerCase()) || n.server.includes(q) || n.protocol.includes(q)));
+ if(sortUsage)filtered.sort((a,b)=>(b.traffic?.total??-1)-(a.traffic?.total??-1));
+ const serverOptions=[...new Map(order.filter(n=>n.server_id).map(n=>[n.server_id,n.server_name])).entries()];
+  const canDrag = !q && source !== "" && !serverFilter && !sortUsage;
 
   return (
     <div>
@@ -117,14 +126,23 @@ export function NodesPage() {
           </>
         }
       />
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <Tabs value={source} onChange={(v) => { setSource(v); setSelected(new Set()); }} items={[{ value: "", label: "全部" }, { value: "manual", label: "手动" }, { value: "imported", label: "订阅导入" }, { value: "deployed", label: "已部署" }, { value: "chain", label: "链式" }]} />
-        <div className="flex items-center gap-2">
-          <div className="relative">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <Tabs className="shrink-0" value={source} onChange={(v) => { setSource(v); setSelected(new Set()); }} items={[{ value: "", label: "全部" }, { value: "manual", label: "手动" }, { value: "imported", label: "订阅导入" }, { value: "deployed", label: "已部署" }, { value: "chain", label: "链式" }]} />
+        <div className="flex w-full flex-wrap items-center gap-3 xl:w-auto">
+          <div className="relative w-full sm:w-56 sm:shrink-0">
             <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-            <Input className="w-56 pl-8" placeholder="搜索名称 / 地址 / 协议" value={q} onChange={(e) => setQ(e.target.value)} />
+            <Input className="w-full pl-8" placeholder="搜索名称 / 地址 / 协议" value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
-          <Switch checked={showRevoked} onChange={setShowRevoked} label="含已撤销" />
+          <div className="w-full sm:w-44 sm:shrink-0">
+            <Select aria-label="按服务器筛选" value={serverFilter} onChange={(e) => setServerFilter(e.target.value)}>
+              <option value="">全部服务器</option>
+              {serverOptions.map(([id, name]) => <option key={id} value={String(id)}>{name}</option>)}
+            </Select>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="shrink-0 whitespace-nowrap"><Switch checked={sortUsage} onChange={setSortUsage} label="按用量排序" /></div>
+            <div className="shrink-0 whitespace-nowrap"><Switch checked={showRevoked} onChange={setShowRevoked} label="含已撤销" /></div>
+          </div>
         </div>
       </div>
       {selected.size > 0 && (
@@ -134,6 +152,9 @@ export function NodesPage() {
           {selected.size === 1 && [...selected].some((id) => order.find((n) => n.id === id)?.source === "chain") && (
             <Button size="sm" variant="outline" onClick={() => setChainOpen(true)}><Unlink className="h-4 w-4" /> 解除链式</Button>
           )}
+          <Button size="sm" variant="outline" disabled={resettable.length === 0 || selected.size > 500} onClick={() => setResetNodes(order.filter((n) => selected.has(n.id)))}><RotateCcw className="h-4 w-4" /> 批量重置凭据{resettable.length > 0 ? `（${resettable.length}）` : ""}</Button>
+          {resettable.length < selected.size && <span className="text-muted-foreground">仅支持未撤销的已部署节点</span>}
+          {selected.size > 500 && <span className="text-muted-foreground">每次最多选择 500 个节点</span>}
           <Button size="sm" variant="destructive" onClick={() => setConfirmBulk(true)}><Trash2 className="h-4 w-4" /> 删除</Button>
           <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>取消选择</Button>
         </div>
@@ -150,7 +171,7 @@ export function NodesPage() {
                 <tr className="border-b">
                   <Th className="w-8"><input type="checkbox" className="h-4 w-4 accent-primary" checked={selected.size > 0 && selected.size === filtered.length} onChange={(e) => setSelected(e.target.checked ? new Set(filtered.map((n) => n.id)) : new Set())} /></Th>
                   <Th className="w-8"></Th>
-                  <Th>名称</Th><Th>协议</Th><Th>地址</Th><Th>来源</Th><Th>状态</Th><Th></Th>
+                  <Th>名称</Th><Th>协议</Th><Th>地址</Th><Th>来源</Th><Th>近 30 天用量</Th><Th>状态</Th><Th></Th>
                 </tr>
               </thead>
               <tbody>
@@ -171,6 +192,7 @@ export function NodesPage() {
       <NodeEditDialog open={createOpen} onClose={() => setCreateOpen(false)} />
       <NodeDetailDialog node={detail} onClose={() => setDetail(null)} />
       <Confirm open={confirmBulk} onClose={() => setConfirmBulk(false)} onConfirm={() => bulkDel.mutate()} loading={bulkDel.isPending} destructive title={`删除 ${selected.size} 个节点？`} description="分享节点不会被删除；已部署节点会从服务器上撤下。" />
+      {resetNodes && <BulkResetDialog nodes={resetNodes} onClose={() => setResetNodes(null)} onDone={() => setSelected(new Set())} />}
       <ChainDialog
         open={chainOpen}
         onClose={() => setChainOpen(false)}
@@ -182,14 +204,70 @@ export function NodesPage() {
   );
 }
 
+type BulkResetResponse = {
+  rotated: number;
+  results: { id: number; name: string; status: "rotated" | "skipped" | "failed"; message: string }[];
+  servers: { id: number; name: string; published: boolean; revision: number }[];
+};
+
+function BulkResetDialog({ nodes, onClose, onDone }: { nodes: Node[]; onClose: () => void; onDone: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [result, setResult] = React.useState<BulkResetResponse | null>(null);
+  const eligible = nodes.filter((n) => n.source === "deployed" && n.server_id && !n.revoked);
+  const reset = useMutation({
+    mutationFn: () => post<BulkResetResponse>("/api/v1/nodes/bulk-regenerate", { ids: nodes.map((n) => n.id) }),
+    onSuccess: (data) => {
+      setResult(data);
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["subscriptions"] });
+      qc.invalidateQueries({ queryKey: ["servers"] });
+      qc.invalidateQueries({ queryKey: ["shares"] });
+      onDone();
+    },
+    onError: (e) => toast.fromError(e),
+  });
+  const retry = useMutation({
+    mutationFn: (id: number) => post(`/api/v1/servers/${id}/republish`),
+    onSuccess: (_data, id) => {
+      setResult((current) => current && ({ ...current, servers: current.servers.map((s) => s.id === id ? { ...s, published: true } : s) }));
+      qc.invalidateQueries({ queryKey: ["servers"] });
+    },
+    onError: (e) => toast.fromError(e),
+  });
+  return <Dialog open onClose={() => { if (!reset.isPending && !retry.isPending) onClose(); }} size="md"
+    title={result ? "批量重置结果" : `重置 ${eligible.length} 个节点的凭据？`}
+    footer={result ? <Button onClick={onClose} disabled={retry.isPending}>完成</Button> : <>
+      <Button variant="outline" onClick={onClose} disabled={reset.isPending}>取消</Button>
+      <Button variant="destructive" loading={reset.isPending} disabled={eligible.length === 0} onClick={() => reset.mutate()}>确认重置</Button>
+    </>}>
+    {result ? <div className="space-y-4 text-sm">
+      <p>已更新 {result.rotated} 个，跳过 {result.results.filter((n) => n.status === "skipped").length} 个，失败 {result.results.filter((n) => n.status === "failed").length} 个。</p>
+      <p className="text-muted-foreground">订阅链接不变，请客户端更新订阅。旧凭据要等服务器应用配置后才失效；离线服务器恢复连接后才能应用。可进入服务器详情查看应用状态。</p>
+      {result.servers.map((server) => <div key={server.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
+        <div><Link className="font-medium underline" to={`/servers/${server.id}`}>{server.name}</Link><p className={server.published ? "text-muted-foreground" : "text-destructive"}>{server.published ? "配置已提交，待确认应用" : "配置提交失败，新凭据已保存；请重试下发"}</p></div>
+        {!server.published && <Button size="sm" variant="outline" loading={retry.isPending && retry.variables === server.id} disabled={retry.isPending} onClick={() => retry.mutate(server.id)}>重试下发</Button>}
+      </div>)}
+      <ul className="space-y-2">{result.results.map((node) => <li key={node.id}><span className="font-medium">{node.name || `节点 #${node.id}`}</span>：{node.message}</li>)}</ul>
+    </div> : <div className="space-y-3 text-sm">
+      <p>重新生成所选节点的 UUID、密码等凭据，保留节点名称、端口和订阅链接。所有使用这些节点的客户端都需要更新订阅。</p>
+      <p className="text-muted-foreground">服务器应用配置后旧凭据才会失效。如果订阅链接也已泄露，还需要更换订阅链接。</p>
+      {eligible.length < nodes.length && <p>将跳过 {nodes.length - eligible.length} 个不支持的节点。链式节点请重置其前置或落地原始节点。</p>}
+      <ul className="list-inside list-disc">{eligible.map((node) => <li key={node.id}>{node.name}</li>)}</ul>
+    </div>}
+  </Dialog>;
+}
+
 function ChainDialog({ open, onClose, nodes, selectedIds, onDone }: { open: boolean; onClose: () => void; nodes: Node[]; selectedIds: number[]; onDone: () => void }) {
   const qc = useQueryClient();
   const toast = useToast();
   const picked = selectedIds.map((id) => nodes.find((n) => n.id === id)).filter((n): n is Node => !!n);
   const [frontId, setFrontId] = React.useState(0);
   const [landingId, setLandingId] = React.useState(0);
+  const [name, setName] = React.useState<string | null>(null);
   React.useEffect(() => {
     if (!open) return;
+    setName(null);
     if (picked.length === 2) {
       setFrontId(picked[0].id);
       setLandingId(picked[1].id);
@@ -205,10 +283,11 @@ function ChainDialog({ open, onClose, nodes, selectedIds, onDone }: { open: bool
   }, [open, selectedIds.join(","), nodes]);
   const front = nodes.find((n) => n.id === frontId);
   const landing = nodes.find((n) => n.id === landingId);
+  const chainName = name ?? `${front?.name ?? "前置"} → ${landing?.name ?? "落地"}`;
   const save = useMutation({
-    mutationFn: () => post<Node>("/api/v1/nodes/chain", { front_id: frontId, landing_id: landingId }),
-    onSuccess: () => {
-      toast.success(`已新增链式节点 ${front?.name ?? "前置"} → ${landing?.name ?? "落地"}`);
+    mutationFn: () => post<Node>("/api/v1/nodes/chain", { front_id: frontId, landing_id: landingId, name: chainName.trim() }),
+    onSuccess: (node) => {
+      toast.success(`已保存链式节点 ${node.name}`);
       qc.invalidateQueries({ queryKey: ["nodes"] });
       qc.invalidateQueries({ queryKey: ["subscriptions"] });
       onDone();
@@ -239,7 +318,7 @@ function ChainDialog({ open, onClose, nodes, selectedIds, onDone }: { open: bool
             <Button variant="ghost" className="text-red-500" onClick={() => clear.mutate()} loading={clear.isPending}><Unlink className="h-4 w-4" /> 解除</Button>
           )}
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!frontId || !landingId || frontId === landingId}>保存</Button>
+          <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!frontId || !landingId || frontId === landingId || !chainName.trim()}>保存</Button>
         </>
       }
     >
@@ -258,8 +337,13 @@ function ChainDialog({ open, onClose, nodes, selectedIds, onDone }: { open: bool
           </Select>
         </Field>
       </div>
+      <div className="mt-3">
+        <Field label="链式节点名称">
+          <Input aria-label="链式节点名称" value={chainName} onChange={(e) => setName(e.target.value)} />
+        </Field>
+      </div>
       {front && landing && (
-        <p className="mt-3 text-sm text-muted-foreground">将新增 <span className="font-medium text-foreground">{front.name} → {landing.name}</span>：本机 → {front.name} → {landing.name}</p>
+        <p className="mt-3 text-sm text-muted-foreground">将新增 <span className="font-medium text-foreground">{chainName.trim()}</span>：本机 → {front.name} → {landing.name}</p>
       )}
     </Dialog>
   );
@@ -378,8 +462,9 @@ export function NodeDetailDialog({ node, onClose }: { node: Node | null; onClose
   const [confirmDel, setConfirmDel] = React.useState(false);
   const [confirmRegen, setConfirmRegen] = React.useState(false);
   const [showQR, setShowQR] = React.useState(false);
+ const [trafficDays,setTrafficDays]=React.useState(30);
   const uri = useQuery({ queryKey: ["nodes", node?.id, "uri"], queryFn: () => get<{ uri: string; clash: Record<string, unknown>; surge: string }>(`/api/v1/nodes/${node!.id}/uri`), enabled: !!node });
-  const traffic = useQuery({ queryKey: ["nodes", node?.id, "traffic"], queryFn: () => get<Series>(`/api/v1/nodes/${node!.id}/traffic?days=30`), enabled: !!node && node.source === "deployed" });
+  const traffic = useQuery({ queryKey: ["nodes", node?.id, "traffic",trafficDays], queryFn: () => get<Series>(`/api/v1/nodes/${node!.id}/traffic?days=${trafficDays}`), refetchInterval:30000, enabled: !!node && node.source === "deployed" });
   const delM = useMutation({ mutationFn: () => del(`/api/v1/nodes/${node!.id}`), onSuccess: () => { toast.success("已删除"); qc.invalidateQueries({ queryKey: ["nodes"] }); qc.invalidateQueries({ queryKey: ["servers"] }); onClose(); }, onError: (e) => toast.fromError(e) });
   const regen = useMutation({ mutationFn: () => post(`/api/v1/nodes/${node!.id}/regenerate`), onSuccess: () => { toast.success("凭据已重置，订阅将自动更新"); setConfirmRegen(false); qc.invalidateQueries({ queryKey: ["nodes"] }); }, onError: (e) => toast.fromError(e) });
   const toggle = useMutation({ mutationFn: (enabled: boolean) => put(`/api/v1/nodes/${node!.id}`, { enabled }), onSuccess: () => { qc.invalidateQueries({ queryKey: ["nodes"] }); onClose(); }, onError: (e) => toast.fromError(e) });
@@ -425,18 +510,16 @@ export function NodeDetailDialog({ node, onClose }: { node: Node | null; onClose
                 <Pre className="max-h-64">{JSON.stringify(uri.data.clash, null, 2)}</Pre>
               </div>
             )}
-            {node.source === "deployed" && traffic.data && (
-              <div>
-                <p className="mb-1 text-xs font-medium text-muted-foreground">近 30 天流量</p>
-                <TrafficBars points={traffic.data.points} height={160} />
-              </div>
-            )}
+            {node.source === "deployed" && <div className="space-y-2">
+              <Select aria-label="节点流量时间范围" value={trafficDays} onChange={e=>setTrafficDays(Number(e.target.value))}>{[7,30,90].map(d=><option key={d} value={d}>近 {d} 天流量</option>)}</Select>
+              {traffic.isError ? <p className="text-sm text-destructive">流量加载失败，请稍后重试</p> : traffic.isLoading ? <Spinner /> : traffic.data?.has_data ? <><TrafficIO inbound={traffic.data.total_up} outbound={traffic.data.total_down}/><TrafficBars points={traffic.data.points} height={160}/><p className="text-xs text-muted-foreground">仅汇总已采集数据；无记录的日期不代表实际未使用。</p></> : <p className="text-sm text-muted-foreground">该时间范围暂无用量记录</p>}
+            </div>}
           </div>
         </div>
       </Dialog>
       <NodeEditDialog open={edit} onClose={() => { setEdit(false); onClose(); }} node={node} />
       <Confirm open={confirmDel} onClose={() => setConfirmDel(false)} onConfirm={() => delM.mutate()} loading={delM.isPending} destructive title="删除节点？" description={node.source === "deployed" ? "该节点会从服务器上撤下，使用它的订阅将不再包含它。" : "使用它的订阅将不再包含它。"} />
-      <Confirm open={confirmRegen} onClose={() => setConfirmRegen(false)} onConfirm={() => regen.mutate()} loading={regen.isPending} title="重置凭据？" description="将重新生成 UUID/密码/Reality 密钥，旧客户端配置立即失效，订阅自动更新。" />
+      <Confirm open={confirmRegen} onClose={() => setConfirmRegen(false)} onConfirm={() => regen.mutate()} loading={regen.isPending} title="重置凭据？" description="将重新生成 UUID/密码/Reality 密钥，服务器应用配置后旧凭据失效；订阅链接不变，请客户端更新订阅。" />
     </>
   );
 }
@@ -449,5 +532,5 @@ export function QR({ text, className }: { text: string; className?: string }) {
     return () => { alive = false; };
   }, [text]);
   if (!svg) return null;
-  return <div className={cn("mx-auto mt-2 w-48 rounded-md bg-white p-2 [&>svg]:h-full [&>svg]:w-full", className)} dangerouslySetInnerHTML={{ __html: svg }} />;
+  return <div className={cn("mx-auto mt-2 w-48 rounded-md bg-white p-2", className)}><img className="h-full w-full" alt="节点二维码" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`} /></div>;
 }

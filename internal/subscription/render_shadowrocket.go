@@ -65,6 +65,9 @@ func ShadowrocketProxyLine(p proxynode.Proxy, via string) string {
 	var parts []string
 	add := func(k, v string) {
 		if v != "" {
+			if strings.ContainsAny(v, ",\"\r\n") {
+				v = surgeQuote(v)
+			}
 			parts = append(parts, k+"="+v)
 		}
 	}
@@ -95,8 +98,8 @@ func ShadowrocketProxyLine(p proxynode.Proxy, via string) string {
 	if ro := p.Sub("reality-opts"); ro != nil {
 		addBool("tls", true)
 		addBool("reality", true)
-		add("public-key", mapStr(ro, "public-key"))
-		add("short-id", mapStr(ro, "short-id"))
+		add("pbk", mapStr(ro, "public-key"))
+		add("sid", mapStr(ro, "short-id"))
 	} else if p.Bool("tls") {
 		addBool("tls", true)
 	}
@@ -104,9 +107,9 @@ func ShadowrocketProxyLine(p proxynode.Proxy, via string) string {
 		add("allow-insecure", "true")
 	}
 	add("flow", p.Str("flow"))
-	add("client-fingerprint", p.Str("client-fingerprint"))
+	add("fp", p.Str("client-fingerprint"))
 	if via != "" {
-		add("underlying-proxy", surgeQuote(via))
+		parts = append(parts, "underlying-proxy="+surgeQuote(via))
 	}
 	return surgeIdent(p.Name) + " = " + strings.Join(parts, ", ")
 }

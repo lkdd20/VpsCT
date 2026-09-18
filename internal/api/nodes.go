@@ -28,6 +28,7 @@ func queryInt64Ptr(r *http.Request, name string) *int64 {
 
 // NodeView adds derived display fields.
 type NodeView struct {
+	Traffic *store.TrafficSummary `json:"traffic,omitempty"`
 	domain.Node
 	URI            string `json:"uri,omitempty"`
 	ServerName     string `json:"server_name,omitempty"`
@@ -56,10 +57,16 @@ func (a *API) nodeViews(r *http.Request, nodes []domain.Node) []NodeView {
 			exts[e.ID] = e.Name
 		}
 	}
+	summaries, summaryErr := a.Store.NodeTrafficSummaries(ctx, 30)
 	hosts := a.serverHosts(r)
 	out := make([]NodeView, 0, len(nodes))
 	for _, n := range nodes {
 		v := NodeView{Node: n}
+		if n.Source == domain.NodeDeployed && summaryErr == nil {
+			summary := summaries[n.ID]
+			summary.Days = 30
+			v.Traffic = &summary
+		}
 		if n.ServerID != nil {
 			v.ServerName = servers[*n.ServerID]
 		}
@@ -119,10 +126,10 @@ func (a *API) serverHosts(r *http.Request) map[int64]string {
 
 func (a *API) listNodes(w http.ResponseWriter, r *http.Request) error {
 	f := store.NodeFilter{
-		Source:        domain.NodeSource(r.URL.Query().Get("source")),
-		ServerID:      queryInt64Ptr(r, "server_id"),
-		ExternalSubID: queryInt64Ptr(r, "external_sub_id"),
-		ShareID:       queryInt64Ptr(r, "share_id"),
+		Source:         domain.NodeSource(r.URL.Query().Get("source")),
+		ServerID:       queryInt64Ptr(r, "server_id"),
+		ExternalSubID:  queryInt64Ptr(r, "external_sub_id"),
+		ShareID:        queryInt64Ptr(r, "share_id"),
 		IncludeRevoked: r.URL.Query().Get("include_revoked") == "1",
 	}
 	nodes, err := a.Store.ListNodes(r.Context(), f)
@@ -143,15 +150,15 @@ func (a *API) listNodes(w http.ResponseWriter, r *http.Request) error {
 }
 
 type nodeInput struct {
-	Name     string          `json:"name"`
-	Protocol string          `json:"protocol"`
-	Server   string          `json:"server"`
-	Port     int             `json:"port"`
-	Params   json.RawMessage `json:"params"`
-	Tags     []string        `json:"tags"`
-	Enabled  *bool           `json:"enabled"`
-	URI      string          `json:"uri"` // alternative to fields
-	ChainFrontNodeID *int64  `json:"chain_front_node_id"`
+	Name             string          `json:"name"`
+	Protocol         string          `json:"protocol"`
+	Server           string          `json:"server"`
+	Port             int             `json:"port"`
+	Params           json.RawMessage `json:"params"`
+	Tags             []string        `json:"tags"`
+	Enabled          *bool           `json:"enabled"`
+	URI              string          `json:"uri"` // alternative to fields
+	ChainFrontNodeID *int64          `json:"chain_front_node_id"`
 }
 
 func (in nodeInput) apply(n *domain.Node) error {
@@ -325,8 +332,9 @@ func (a *API) bulkDeleteNodes(w http.ResponseWriter, r *http.Request) error {
 
 func (a *API) setNodeChain(w http.ResponseWriter, r *http.Request) error {
 	var in struct {
-		FrontID   int64 `json:"front_id"`
-		LandingID int64 `json:"landing_id"`
+		Name      string `json:"name"`
+		FrontID   int64  `json:"front_id"`
+		LandingID int64  `json:"landing_id"`
 	}
 	if err := httpx.Decode(r, &in); err != nil {
 		return err
@@ -376,13 +384,24 @@ func (a *API) setNodeChain(w http.ResponseWriter, r *http.Request) error {
 	if front.Revoked || landing.Revoked {
 		return httpx.BadRequest("已撤销的节点不能组成链式")
 	}
+	name := strings.TrimSpace(in.Name)
 	if existing, err := a.Store.FindChainNode(r.Context(), front.ID, landing.Server, landing.Port); err == nil {
+		if name != "" && name != existing.Name {
+			existing.Name = name
+			if err := a.Store.UpdateNode(r.Context(), &existing); err != nil {
+				return err
+			}
+			a.audit(r, "node.chain", existing.Name, nil)
+		}
 		httpx.OK(w, a.nodeViews(r, []domain.Node{existing})[0])
 		return nil
 	}
+	if name == "" {
+		name = front.Name + " → " + landing.Name
+	}
 	frontID := front.ID
 	ch := domain.Node{
-		Name:             front.Name + " → " + landing.Name,
+		Name:             name,
 		Protocol:         landing.Protocol,
 		Server:           landing.Server,
 		Port:             landing.Port,
@@ -530,7 +549,7 @@ func (a *API) regenerateNode(w http.ResponseWriter, r *http.Request) error {
 	if err := provision.RegenerateCredentials(&n, s); err != nil {
 		return err
 	}
-	if err := a.Store.UpdateNode(r.Context(), &n); err != nil {
+	if err := a.Store.UpdateNodeCredentials(r.Context(), &n); err != nil {
 		return err
 	}
 	_, _, _ = a.Desired.Publish(r.Context(), s.ID)

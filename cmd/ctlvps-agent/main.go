@@ -14,8 +14,13 @@ import (
 	"time"
 
 	"ctlvps/internal/agent"
+	"ctlvps/internal/agentnet"
 	"ctlvps/internal/buildinfo"
+	"ctlvps/internal/core"
 	"ctlvps/internal/maintenance"
+	"ctlvps/internal/proxyguard"
+	"ctlvps/internal/proxysandbox"
+	"ctlvps/internal/secureupdate"
 )
 
 func usage() {
@@ -31,6 +36,44 @@ usage:
 }
 
 func main() {
+	for _, entry := range []func([]string) (bool, error){core.InstallEntry, agent.UpdateEntry} {
+		if handled, err := entry(os.Args[1:]); handled {
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
+
+	if handled, err := proxyguard.Entry(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := proxysandbox.Entry(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := agentnet.Entry(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if handled, err := secureupdate.Entry(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if handled, err := maintenance.Entry(os.Args[1:]); handled {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -65,6 +108,7 @@ func main() {
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		state := fs.String("state", defaultState(), "state directory")
 		level := fs.String("log-level", "info", "debug|info|warn|error")
+		hold := fs.Bool("hold-updates", false, "pin local canary binary; pause auto-update and web maintenance")
 		_ = fs.Parse(os.Args[2:])
 		logger := newLogger(*level)
 		st, err := agent.LoadState(*state)
@@ -73,6 +117,7 @@ func main() {
 			os.Exit(1)
 		}
 		a := agent.New(*state, st, logger, buildinfo.Version)
+		a.HoldUpdates = *hold
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		logger.Info("ctlvps-agent starting", "version", buildinfo.String(), "server", st.ServerURL, "server_id", st.ServerID)

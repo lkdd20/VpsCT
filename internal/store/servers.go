@@ -66,9 +66,27 @@ func (s *Store) UpdateServer(ctx context.Context, v *domain.Server) error {
 	return err
 }
 
-// DeleteServer removes a server (agent, desired states cascade; nodes are unbound).
+// DeleteServer atomically removes the server, its nodes and dependent chains.
 func (s *Store) DeleteServer(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM servers WHERE id=?`, id)
+	return s.Tx(ctx, func(tx *sql.Tx) error { return deleteServerTx(ctx, tx, id) })
+}
+
+func deleteServerTx(ctx context.Context, tx *sql.Tx, id int64) error {
+	// Chains copy the landing endpoint rather than keeping a landing node ID.
+	// Resolve both landing and front dependencies before removing any nodes.
+	if _, err := tx.ExecContext(ctx, `WITH RECURSIVE removed(id) AS (
+			SELECT id FROM nodes WHERE server_id=?
+			UNION
+			SELECT chain.id FROM nodes chain JOIN nodes landing
+			ON chain.server=landing.server AND chain.port=landing.port AND chain.protocol=landing.protocol
+			WHERE chain.source='chain' AND landing.server_id=?
+			UNION
+			SELECT chain.id FROM nodes chain JOIN removed ON chain.chain_front_node_id=removed.id
+			WHERE chain.source='chain'
+		) DELETE FROM nodes WHERE id IN (SELECT id FROM removed)`, id, id); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE id=?`, id)
 	return err
 }
 
@@ -179,11 +197,21 @@ func (s *Store) SetAgentEnrollToken(ctx context.Context, serverID int64, hash st
 }
 
 // CompleteEnrollment swaps the enrolment token for a permanent token.
-func (s *Store) CompleteEnrollment(ctx context.Context, agentID int64, tokenHash, version string) error {
+func (s *Store) CompleteEnrollment(ctx context.Context, agentID int64, enrollHash, tokenHash, version string) error {
 	now := fmtTime(s.Now())
-	_, err := s.db.ExecContext(ctx, `UPDATE agents SET token_hash=?, enroll_token_hash='', enroll_expires_at=NULL, version=?, last_seen_at=?, updated_at=? WHERE id=?`,
-		tokenHash, version, now, now, agentID)
-	return err
+	res, err := s.db.ExecContext(ctx, `UPDATE agents SET token_hash=?, enroll_token_hash='', enroll_expires_at=NULL, version=?, last_seen_at=?, updated_at=? WHERE id=? AND enroll_token_hash=? AND enroll_token_hash!='' AND enroll_expires_at>?`,
+		tokenHash, version, now, now, agentID, enrollHash, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ResetAgentToken revokes the current token (agent must re-enrol).

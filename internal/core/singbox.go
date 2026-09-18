@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"ctlvps/internal/agentproto"
+	"ctlvps/internal/nft"
 )
 
 // SingBox drives a single sing-box service hosting all sing-box nodes.
@@ -23,7 +26,10 @@ type SingBox struct {
 	// It is injected so config generation is testable without disk access.
 	CertResolver func(spec *agentproto.CertSpec) (CertFiles, error)
 	// Email used for ACME registrations (optional).
-	ACMEEmail string
+	ACMEEmail     string
+	binaryChanged bool
+	private       bool
+	runtimeACME   string
 }
 
 // NewSingBox builds the driver with default resolvers.
@@ -39,7 +45,7 @@ func NewSingBox(p Paths, sd *Systemd) *SingBox {
 }
 
 const (
-	singboxUnit         = "ctlvps-singbox.service" // legacy monolith, stopped on apply
+	singboxUnit         = "ctlvps-singbox.service" // shared process
 	singboxTemplateUnit = "ctlvps-singbox@.service"
 )
 
@@ -63,23 +69,13 @@ func (d *SingBox) instanceConfig(port int) string {
 // EnsureInstalled implements Driver.
 func (d *SingBox) EnsureInstalled(ctx context.Context, v agentproto.CoreVersion) (bool, error) {
 	cur := recordedVersion(d.bin())
-	if cur == "" {
-		if out := installedVersion(ctx, d.bin(), "version"); out != "" {
-			// "sing-box version 1.12.14\n..."
-			for _, f := range strings.Fields(out) {
-				if strings.Count(f, ".") >= 2 && f[0] >= '0' && f[0] <= '9' {
-					cur = f
-					break
-				}
-			}
-		}
-	}
 	if cur == v.Version && cur != "" {
 		return false, nil
 	}
 	if err := installBinary(ctx, d.Paths.BinDir, "sing-box", v); err != nil {
 		return false, fmt.Errorf("install sing-box %s: %w", v.Version, err)
 	}
+	d.binaryChanged = true
 	return true, nil
 }
 
@@ -100,7 +96,7 @@ func (d *SingBox) tlsBlock(spec agentproto.NodeSpec, ds *agentproto.DesiredState
 	tls["server_name"] = domain
 	switch cert.Mode {
 	case "acme":
-		acme := map[string]any{"domain": []string{domain}, "data_directory": filepath.Join(d.Paths.DataDir, "acme"), "default_server_name": domain, "provider": "letsencrypt"}
+		acme := map[string]any{"domain": []string{domain}, "data_directory": firstNonEmpty(d.runtimeACME, filepath.Join(d.Paths.DataDir, "acme")), "default_server_name": domain, "provider": "letsencrypt"}
 		if email := firstNonEmpty(cert.Email, d.ACMEEmail); email != "" {
 			acme["email"] = email
 		}
@@ -141,10 +137,26 @@ func (d *SingBox) BuildConfig(ds *agentproto.DesiredState, nodes []agentproto.No
 	sorted := append([]agentproto.NodeSpec(nil), nodes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
 	logLevel := "warn"
+	outbounds := []any{}
+	rules := []any{}
+	denied := []string{}
 	for _, n := range sorted {
-		if n.Blocked {
-			continue // no inbound = connection refused, nothing to meter
+		if !n.AllowPrivate {
+			denied = append(denied, InboundTag(n.NodeID))
 		}
+	}
+	if len(denied) > 0 {
+		rules = append(rules, map[string]any{"inbound": denied, "ip_is_private": true, "action": "reject"})
+	}
+	for _, n := range sorted {
+		// Access is enforced by nftables, independently of process lifetime.
+		mark, err := nft.NodeMark(n.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		outTag := fmt.Sprintf("node-%d-direct", n.NodeID)
+		outbounds = append(outbounds, map[string]any{"type": "direct", "tag": outTag, "routing_mark": mark})
+		rules = append(rules, map[string]any{"inbound": []string{InboundTag(n.NodeID)}, "action": "route", "outbound": outTag})
 		if n.ConnlogEnabled {
 			logLevel = "info"
 		}
@@ -163,7 +175,7 @@ func (d *SingBox) BuildConfig(ds *agentproto.DesiredState, nodes []agentproto.No
 				"server_name": str(p, "handshake_server"),
 				"reality": map[string]any{
 					"enabled":     true,
-					"handshake":   map[string]any{"server": str(p, "handshake_server"), "server_port": hsPort},
+					"handshake":   map[string]any{"server": str(p, "handshake_server"), "server_port": hsPort, "routing_mark": mark},
 					"private_key": str(p, "reality_private_key"),
 					"short_id":    []string{str(p, "reality_short_id")},
 				},
@@ -182,7 +194,8 @@ func (d *SingBox) BuildConfig(ds *agentproto.DesiredState, nodes []agentproto.No
 			if op := str(p, "obfs_password"); op != "" {
 				in["obfs"] = map[string]any{"type": "salamander", "password": op}
 			}
-			in["masquerade"] = "https://www.bing.com"
+			// A local decoy avoids unassigned outbound traffic on failed auth.
+			in["masquerade"] = map[string]any{"type": "string", "status_code": 404, "content": "Not Found"}
 			in["ignore_client_bandwidth"] = false
 			tls, err := d.tlsBlock(n, ds, []string{"h3"})
 			if err != nil {
@@ -220,163 +233,376 @@ func (d *SingBox) BuildConfig(ds *agentproto.DesiredState, nodes []agentproto.No
 		strategy = "ipv4_only"
 	}
 	cfg := map[string]any{
-		"log": map[string]any{"level": logLevel, "timestamp": true, "output": d.Paths.LogPath()},
-		"dns": map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}},
+		"log":       map[string]any{"level": logLevel, "timestamp": true, "output": d.logPath()},
+		"dns":       map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}},
 		"inbounds":  inbounds,
-		"outbounds": []any{map[string]any{"type": "direct", "tag": "direct"}},
+		"outbounds": outbounds,
 		"route": map[string]any{
 			"default_domain_resolver": map[string]any{"server": "local", "strategy": strategy},
-			"rules":                   []any{map[string]any{"ip_is_private": true, "action": "reject"}},
-			"final":                   "direct",
+			"rules":                   rules,
 		},
 	}
 	return cfg, nil
 }
 
-func (d *SingBox) stopLegacy(ctx context.Context) bool {
-	if !d.Systemd.IsActive(ctx, singboxUnit) {
-		return false
+func (d *SingBox) stopAllInstances(ctx context.Context) (bool, error) {
+	units := d.Systemd.ListUnits(ctx, "ctlvps-singbox@*.service")
+	if _, err := os.Stat(filepath.Join(d.Systemd.UnitDir, singboxUnit)); err == nil || d.Systemd.IsActive(ctx, singboxUnit) {
+		units = append(units, singboxUnit)
 	}
-	_ = d.Systemd.StopDisable(ctx, singboxUnit)
-	return true
+	if _, e := os.Stat(filepath.Join(d.Systemd.UnitDir, "ctlvps-singbox-private.service")); e == nil || d.Systemd.IsActive(ctx, "ctlvps-singbox-private.service") {
+		units = append(units, "ctlvps-singbox-private.service")
+	}
+	var errs []error
+	for _, u := range units {
+		if err := d.Systemd.StopDisable(ctx, u); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return len(units) > 0, errors.Join(errs...)
 }
 
-func (d *SingBox) stopAllInstances(ctx context.Context) bool {
-	changed := d.stopLegacy(ctx)
-	for _, u := range d.Systemd.ListUnits(ctx, "ctlvps-singbox@*.service") {
-		_ = d.Systemd.StopDisable(ctx, u)
-		changed = true
-	}
-	return changed
-}
-
-// Apply implements Driver.
-func (d *SingBox) Apply(ctx context.Context, ds *agentproto.DesiredState, nodes []agentproto.NodeSpec) (bool, error) {
-	changed := d.stopLegacy(ctx)
-	live := 0
+// Apply preflights all permission groups before the first running service stops.
+func (d *SingBox) Apply(ctx context.Context, ds *agentproto.DesiredState, nodes []agentproto.NodeSpec) (changed bool, applyErr error) {
+	groups := map[string][]agentproto.NodeSpec{"public": {}, "private": {}}
+	acme := false
 	for _, n := range nodes {
-		if !n.Blocked {
-			live++
-		}
-	}
-	if live == 0 {
-		return d.stopAllInstances(ctx) || changed, nil
-	}
-	if err := os.MkdirAll(d.Paths.LogDir, 0o755); err != nil {
-		return changed, err
-	}
-	env := fmt.Sprintf("Environment=GOMEMLIMIT=%dMiB", max(ds.Tuning.GoMemLimitMB, 64))
-	unit := ServiceUnit("ctlvps sing-box (%i)", fmt.Sprintf("%s run -c %s/%%i.json", d.bin(), d.confDir()), ds.Tuning, env, "IPAccounting=yes", "ExecReload=/bin/kill -HUP $MAINPID")
-	unitChanged, err := d.Systemd.WriteUnit(singboxTemplateUnit, unit)
-	if err != nil {
-		return changed, err
-	}
-	if unitChanged {
-		changed = true
-		if err := d.Systemd.DaemonReload(ctx); err != nil {
-			return changed, err
-		}
-	}
-	want := map[int]bool{}
-	sorted := append([]agentproto.NodeSpec(nil), nodes...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ListenPort < sorted[j].ListenPort })
-	for _, n := range sorted {
-		if n.Blocked || n.ListenPort <= 0 {
+		if n.Retired {
 			continue
 		}
-		want[n.ListenPort] = true
-		cfg, err := d.BuildConfig(ds, []agentproto.NodeSpec{n})
-		if err != nil {
-			return changed, err
+		profile := "public"
+		if n.AllowPrivate {
+			profile = "private"
 		}
-		data, _ := json.MarshalIndent(cfg, "", "  ")
-		c, err := WriteIfChanged(d.instanceConfig(n.ListenPort), data, 0o600)
-		if err != nil {
-			return changed, err
+		groups[profile] = append(groups[profile], n)
+		if n.Cert != nil && n.Cert.Mode == "acme" {
+			acme = true
 		}
-		u := SingBoxUnit(n.ListenPort)
-		if c || unitChanged || !d.Systemd.IsActive(ctx, u) {
-			if out, err := exec.CommandContext(ctx, d.bin(), "check", "-c", d.instanceConfig(n.ListenPort)).CombinedOutput(); err != nil {
-				return changed, fmt.Errorf("sing-box check :%d: %s", n.ListenPort, strings.TrimSpace(string(out)))
+	}
+	hasLive := func(ns []agentproto.NodeSpec) bool {
+		for _, n := range ns {
+			if !n.Blocked {
+				return true
 			}
-			if err := d.Systemd.EnableRestart(ctx, u); err != nil {
-				return changed, err
+		}
+		return false
+	}
+	twoGroups := hasLive(groups["public"]) && hasLive(groups["private"])
+	// Splitting native ACME storage/challenge listeners is not safe without a
+	// separate compatibility test. Refuse before changing a running service.
+	if acme && twoGroups {
+		return false, fmt.Errorf("mixed private/public ACME groups need explicit compatibility validation; existing services retained")
+	}
+	if twoGroups {
+		budget := ds.Tuning.MemoryMaxMB
+		if budget <= 0 {
+			budget = 256
+		}
+		minimum := 2 * (max(ds.Tuning.GoMemLimitMB, 64) + 32)
+		if budget < minimum {
+			return false, fmt.Errorf("proxy memory budget insufficient for two permission groups; existing services retained")
+		}
+	}
+	launcher, err := proxyLauncher()
+	if err != nil {
+		return false, err
+	}
+	if err = d.Systemd.EnsureProxyGuard(ctx, launcher); err != nil {
+		return false, err
+	}
+	type candidate struct {
+		profile, unit, config, body string
+		data                        []byte
+		gid                         int
+		active                      bool
+	}
+	candidates := []candidate{}
+	for _, profile := range []string{"public", "private"} {
+		live := false
+		for _, n := range groups[profile] {
+			if !n.Blocked {
+				live = true
 			}
+		}
+		if !live {
+			continue
+		}
+		user := "ctlvps-sb"
+		if profile == "private" {
+			user = "ctlvps-sp"
+		}
+		uid, gid, e := proxyIdentity(user)
+		if e != nil {
+			return false, e
+		}
+		dir := filepath.Join(proxyConfigRoot, profile)
+		if e = secureDir(dir, 0, int(gid), 0750); e != nil {
+			return false, e
+		}
+		clone := *d
+		clone.private = profile == "private"
+		origResolver := d.CertResolver
+		clone.CertResolver = func(spec *agentproto.CertSpec) (CertFiles, error) {
+			f, e := origResolver(spec)
+			if e != nil {
+				return f, e
+			}
+			return snapshotCert(f, dir, int(gid))
+		}
+		if e = secureDir(d.Paths.LogDir, 0, 0, 0755); e != nil {
+			return false, e
+		}
+		log := clone.logPath()
+		if st, e := os.Lstat(log); e == nil && !st.Mode().IsRegular() {
+			return false, fmt.Errorf("unsafe proxy log")
+		}
+		f, e := os.OpenFile(log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if e != nil {
+			return false, e
+		}
+		e = f.Chown(int(uid), int(gid))
+		f.Close()
+		if e != nil {
+			return false, e
+		}
+		source, target := "", ""
+		for _, n := range groups[profile] {
+			if n.Cert != nil && n.Cert.Mode == "acme" {
+				source = filepath.Join(d.Paths.DataDir, "acme")
+				target = filepath.Join(proxyStateRoot, profile, "acme")
+				break
+			}
+		}
+		if source != "" {
+			marker := filepath.Join(dir, "acme-ready")
+			if _, e = os.Stat(marker); os.IsNotExist(e) {
+				if e = prepareACME(source, int(uid), int(gid)); e != nil {
+					return false, e
+				}
+				if _, e = proxyFile(marker, []byte(source), int(gid)); e != nil {
+					return false, e
+				}
+			}
+			if e = secureDir(target, 0, 0, 0755); e != nil {
+				return false, e
+			}
+			clone.runtimeACME = target
+		}
+		cfg, e := clone.BuildConfig(ds, groups[profile])
+		if e != nil {
+			return false, e
+		}
+		data, e := json.MarshalIndent(cfg, "", "  ")
+		if e != nil {
+			return false, e
+		}
+		if _, e = proxyFile(filepath.Join(dir, "candidate.json"), data, int(gid)); e != nil {
+			return false, e
+		}
+		props := proxyProperties(user, dir, log, SingBoxSlice(clone.private), source, target, true)
+		if _, e = d.Systemd.EnsureSingBoxSlice(ctx, clone.private); e != nil {
+			return false, e
+		}
+		if e = d.Systemd.CheckProxy(ctx, launcher, profile, props); e != nil {
+			return false, e
+		}
+		props = append(props, fmt.Sprintf("Environment=GOMEMLIMIT=%dMiB", max(ds.Tuning.GoMemLimitMB, 64)), "IPAccounting=yes")
+		unit := singboxUnit
+		if clone.private {
+			unit = "ctlvps-singbox-private.service"
+		}
+		body := ServiceUnit("ctlvps sing-box", launcher+" proxy-exec singbox run "+profile, ds.Tuning, props...)
+		config := filepath.Join(dir, "config.json")
+		old, _ := os.ReadFile(config)
+		oldUnit, _ := os.ReadFile(filepath.Join(d.Systemd.UnitDir, unit))
+		active := d.Systemd.IsActive(ctx, unit)
+		if !bytes.Equal(old, data) || string(oldUnit) != body || !active {
+			changed = true
+		}
+		candidates = append(candidates, candidate{profile, unit, config, body, data, int(gid), active})
+	}
+	units := []string{singboxUnit, "ctlvps-singbox-private.service"}
+	units = append(units, d.Systemd.ListUnits(ctx, "ctlvps-singbox@*.service")...)
+	want := map[string]bool{}
+	for _, c := range candidates {
+		want[c.unit] = true
+	}
+	for _, u := range units {
+		if !want[u] && d.Systemd.IsActive(ctx, u) {
 			changed = true
 		}
 	}
-	for _, u := range d.Systemd.ListUnits(ctx, "ctlvps-singbox@*.service") {
-		portStr := strings.TrimSuffix(strings.TrimPrefix(u, "ctlvps-singbox@"), ".service")
-		port, err := strconv.Atoi(portStr)
-		if err != nil || want[port] {
-			continue
+	changed = changed || d.binaryChanged || activationPending(d.bin())
+	if !changed {
+		for _, c := range candidates {
+			account := "ctlvps-sb"
+			if c.profile == "private" {
+				account = "ctlvps-sp"
+			}
+			if e := d.Systemd.CheckRunningProxy(ctx, c.unit, account, SingBoxSlice(c.profile == "private"), launcher+" proxy-exec singbox run "+c.profile, true); e != nil {
+				return false, e
+			}
 		}
-		_ = d.Systemd.StopDisable(ctx, u)
-		_ = os.Remove(d.instanceConfig(port))
-		changed = true
+		return false, nil
 	}
-	if entries, err := os.ReadDir(d.confDir()); err == nil {
-		for _, e := range entries {
-			p, err := strconv.Atoi(strings.TrimSuffix(e.Name(), ".json"))
-			if err == nil && !want[p] {
-				_ = os.Remove(filepath.Join(d.confDir(), e.Name()))
+	type saved struct {
+		path   string
+		data   []byte
+		exists bool
+		mode   os.FileMode
+		gid    int
+	}
+	backups := []saved{}
+	active := []string{}
+	enabledBefore := map[string]bool{}
+	for _, u := range units {
+		en, _ := d.Systemd.ctl(ctx, "is-enabled", u)
+		enabledBefore[u] = strings.TrimSpace(en) == "enabled"
+		p := filepath.Join(d.Systemd.UnitDir, u)
+		b, e := os.ReadFile(p)
+		backups = append(backups, saved{p, b, e == nil, 0644, -1})
+		if d.Systemd.IsActive(ctx, u) {
+			active = append(active, u)
+		}
+	}
+	for _, c := range candidates {
+		b, e := os.ReadFile(c.config)
+		backups = append(backups, saved{c.config, b, e == nil, 0640, c.gid})
+	}
+	defer func() {
+		if applyErr == nil {
+			return
+		}
+		r, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		stop := []string{}
+		for _, u := range units {
+			if _, e := os.Stat(filepath.Join(d.Systemd.UnitDir, u)); e == nil || d.Systemd.IsActive(r, u) {
+				stop = append(stop, u)
+			}
+		}
+		errs := []error{applyErr, d.Systemd.StopUnits(r, stop)}
+		for _, u := range stop {
+			if !enabledBefore[u] {
+				_, e := d.Systemd.ctl(r, "disable", u)
+				errs = append(errs, e)
+			}
+		}
+		for _, b := range backups {
+			if b.exists {
+				_, e := WriteIfChanged(b.path, b.data, b.mode)
+				errs = append(errs, e)
+				if b.gid >= 0 {
+					errs = append(errs, os.Chown(b.path, 0, b.gid))
+				}
+			} else {
+				if e := os.Remove(b.path); e != nil && !os.IsNotExist(e) {
+					errs = append(errs, e)
+				}
+			}
+		}
+		errs = append(errs, d.Systemd.DaemonReload(r))
+		for _, u := range active {
+			errs = append(errs, d.Systemd.StartUnits(r, []string{u}))
+		}
+		applyErr = errors.Join(errs...)
+	}()
+	for _, u := range active {
+		if err = d.Systemd.StopUnits(ctx, []string{u}); err != nil {
+			return false, err
+		}
+	}
+	for _, c := range candidates {
+		if _, err = proxyFile(c.config, c.data, c.gid); err != nil {
+			return false, err
+		}
+		if _, err = d.Systemd.WriteUnit(c.unit, c.body); err != nil {
+			return false, err
+		}
+	}
+	if err = d.Systemd.DaemonReload(ctx); err != nil {
+		return false, err
+	}
+	for _, c := range candidates {
+		if err = d.Systemd.EnableRestart(ctx, c.unit); err != nil {
+			return false, err
+		}
+	}
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+	}
+	for _, c := range candidates {
+		if !d.Systemd.IsActive(ctx, c.unit) {
+			return false, fmt.Errorf("isolated sing-box activation failed")
+		}
+		user := "ctlvps-sb"
+		if c.profile == "private" {
+			user = "ctlvps-sp"
+		}
+		if err = d.Systemd.CheckRunningProxy(ctx, c.unit, user, SingBoxSlice(c.profile == "private"), launcher+" proxy-exec singbox run "+c.profile, true); err != nil {
+			return false, err
+		}
+	}
+	for _, u := range units {
+		if !want[u] {
+			if _, e := os.Stat(filepath.Join(d.Systemd.UnitDir, u)); os.IsNotExist(e) && !d.Systemd.IsActive(ctx, u) {
+				continue
+			}
+			if err = d.Systemd.StopDisable(ctx, u); err != nil {
+				return false, err
 			}
 		}
 	}
-	_ = os.Remove(d.configPath())
-	return changed, nil
+	if err := completeActivation(d.bin()); err != nil {
+		return true, err
+	}
+	d.binaryChanged = false
+	return true, nil
 }
 
-// Status implements Driver (aggregated over instances).
+func (d *SingBox) logPath() string {
+	if d.private {
+		return filepath.Join(d.Paths.LogDir, "sing-box-private.log")
+	}
+	return d.Paths.LogPath()
+}
+
 func (d *SingBox) Status(ctx context.Context) agentproto.CoreStatus {
 	st := agentproto.CoreStatus{Name: "sing-box", Version: recordedVersion(d.bin())}
-	_, err := os.Stat(d.bin())
-	st.Installed = err == nil
-	if st.Installed && st.Version == "" {
-		st.Version = strings.TrimSpace(strings.TrimPrefix(installedVersion(ctx, d.bin(), "version"), "sing-box version "))
-		if i := strings.IndexByte(st.Version, '\n'); i > 0 {
-			st.Version = st.Version[:i]
-		}
-	}
-	units := d.Systemd.ListUnits(ctx, "ctlvps-singbox@*.service")
-	if len(units) == 0 && d.Systemd.IsActive(ctx, singboxUnit) {
-		one := d.Systemd.Show(ctx, singboxUnit)
-		one.Name, one.Version, one.Installed = st.Name, st.Version, st.Installed
-		return one
-	}
-	st.Instances = len(units)
+	_, e := os.Stat(d.bin())
+	st.Installed = e == nil
 	active := 0
-	for _, u := range units {
-		s := d.Systemd.Show(ctx, u)
-		if s.Active {
+	for _, unit := range []string{singboxUnit, "ctlvps-singbox-private.service"} {
+		current := d.Systemd.Show(ctx, unit)
+		enabled, _ := d.Systemd.ctl(ctx, "is-enabled", unit)
+		if strings.TrimSpace(enabled) != "enabled" && !current.Active {
+			continue
+		}
+		st.Instances++
+		if current.Active {
 			active++
 		}
-		st.RSSBytes += s.RSSBytes
-		st.NRestarts += s.NRestarts
-		if s.LastError != "" && st.LastError == "" {
-			st.LastError = u + ": " + s.LastError
+		st.RSSBytes += current.RSSBytes
+		st.NRestarts += current.NRestarts
+		if current.LastError != "" {
+			st.LastError = current.LastError
 		}
-		if st.Since.IsZero() || (!s.Since.IsZero() && s.Since.Before(st.Since)) {
-			st.Since = s.Since
+		if st.Since.IsZero() || (!current.Since.IsZero() && current.Since.Before(st.Since)) {
+			st.Since = current.Since
 		}
 	}
-	st.Active = len(units) > 0 && active == len(units)
-	if len(units) > 0 && active < len(units) && st.LastError == "" {
-		st.LastError = fmt.Sprintf("%d/%d instances active", active, len(units))
-	}
-	if !st.Active && st.Installed && st.LastError == "" {
-		if lines := d.Systemd.JournalTail(ctx, singboxTemplateUnit, 3); len(lines) > 0 {
-			st.LastError = lines[len(lines)-1]
-		}
+	st.Active = st.Instances > 0 && active == st.Instances
+	if st.Instances > 0 && !st.Active && st.LastError == "" {
+		st.LastError = fmt.Sprintf("%d/%d instances active", active, st.Instances)
 	}
 	return st
 }
 
-// Stop implements Driver.
-func (d *SingBox) Stop(ctx context.Context) error {
-	d.stopAllInstances(ctx)
-	return nil
-}
+func (d *SingBox) Stop(ctx context.Context) error { _, err := d.stopAllInstances(ctx); return err }
 
 // Certs reports certificate expiry for self-signed/external nodes.
 func (d *SingBox) Certs(nodes []agentproto.NodeSpec) []agentproto.CertStatus {
@@ -400,12 +626,26 @@ func (d *SingBox) Certs(nodes []agentproto.NodeSpec) []agentproto.CertStatus {
 
 // RecentErrors returns the newest warning+ lines of the sing-box log.
 func (d *SingBox) RecentErrors(n int) []string {
-	data, err := os.ReadFile(d.Paths.LogPath())
+	out := recentLogErrors(d.Paths.LogPath(), n)
+	out = append(out, recentLogErrors(filepath.Join(d.Paths.LogDir, "sing-box-private.log"), n)...)
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	return out
+}
+
+func recentLogErrors(path string, n int) []string {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
-	if len(data) > 256<<10 {
-		data = data[len(data)-256<<10:]
+	defer f.Close()
+	if st, e := f.Stat(); e == nil && st.Size() > 256<<10 {
+		_, _ = f.Seek(-(256 << 10), 2)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 256<<10))
+	if err != nil {
+		return nil
 	}
 	var out []string
 	for _, line := range bytes.Split(data, []byte("\n")) {

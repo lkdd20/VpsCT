@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ctlvps/internal/agentproto"
+	"ctlvps/internal/boundedexec"
 )
 
 // Systemd wraps systemctl.
@@ -28,18 +29,18 @@ func (s *Systemd) Available(ctx context.Context) bool {
 }
 
 func (s *Systemd) ctl(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "systemctl", args...)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	err := cmd.Run()
+	out, stderr, err := boundedexec.Run(ctx, "", 1<<20, "systemctl", args...)
 	if err != nil {
-		return out.String(), fmt.Errorf("systemctl %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
+		return "", fmt.Errorf("systemctl: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	return out.String(), nil
+	return string(out), nil
 }
 
 // WriteUnit writes a unit file; returns true when content changed.
 func (s *Systemd) WriteUnit(name, content string) (bool, error) {
+	if !strings.HasPrefix(name, "ctlvps-") || strings.Contains(name, "..") || strings.ContainsAny(name, "\\\r\n\x00") || filepath.IsAbs(name) {
+		return false, fmt.Errorf("invalid managed unit name")
+	}
 	return WriteIfChanged(filepath.Join(s.UnitDir, name), []byte(content), 0o644)
 }
 
@@ -51,9 +52,27 @@ func WriteIfChanged(path string, data []byte, perm os.FileMode) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false, err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() {
+		return false, fmt.Errorf("target is not a regular file")
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".ctlvps-write-")
+	if err != nil {
 		return false, err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(perm); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	ce := f.Close()
+	if err != nil {
+		return false, err
+	}
+	if ce != nil {
+		return false, ce
 	}
 	return true, os.Rename(tmp, path)
 }
@@ -84,9 +103,11 @@ func (s *Systemd) Reload(ctx context.Context, unit string) error {
 
 // StopDisable stops and disables a unit (ignores missing units).
 func (s *Systemd) StopDisable(ctx context.Context, unit string) error {
-	_, _ = s.ctl(ctx, "stop", unit)
-	_, _ = s.ctl(ctx, "disable", unit)
-	return nil
+	if _, err := s.ctl(ctx, "stop", unit); err != nil {
+		return err
+	}
+	_, err := s.ctl(ctx, "disable", unit)
+	return err
 }
 
 // IsActive reports whether the unit is running.
@@ -210,10 +231,183 @@ func ServiceUnit(desc, execStart string, t agentproto.Tuning, extra ...string) s
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Unit]\nDescription=%s\nAfter=network-online.target nss-lookup.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n", desc)
-	fmt.Fprintf(&b, "[Service]\nType=simple\nUser=root\nExecStart=%s\nRestart=always\nRestartSec=%d\nLimitNOFILE=%d\nMemoryMax=%dM\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW\nNoNewPrivileges=true\nProtectSystem=full\nProtectHome=true\nPrivateTmp=true\n", execStart, restart, nofile, memMax)
+	fmt.Fprintf(&b, "[Service]\nType=simple\nUser=root\nSlice=ctlvps-proxy.slice\nExecStart=%s\nRestart=always\nRestartSec=%d\nLimitNOFILE=%d\nMemoryMax=%dM\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW\nNoNewPrivileges=true\nProtectSystem=strict\nReadWritePaths=-/var/log/ctlvps -/var/lib/ctlvps-agent\nProtectHome=true\nPrivateTmp=true\nProtectKernelTunables=true\nProtectControlGroups=true\nRestrictSUIDSGID=true\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\nLogRateLimitIntervalSec=30s\nLogRateLimitBurst=100\n", execStart, restart, nofile, memMax)
 	for _, e := range extra {
 		b.WriteString(e + "\n")
 	}
 	b.WriteString("\n[Install]\nWantedBy=multi-user.target\n")
 	return b.String()
+}
+
+// AccountingSnapshot reads every requested unit in one process invocation.
+// InvocationID distinguishes service restarts from a counter rollback.
+type AccountingReading struct {
+	Rx, Tx int64
+	Epoch  string
+	Valid  bool
+}
+
+func (s *Systemd) AccountingSnapshot(ctx context.Context, units []string) (map[string]AccountingReading, error) {
+	out := map[string]AccountingReading{}
+	if len(units) == 0 {
+		return out, nil
+	}
+	args := append([]string{"show", "-p", "Id,InvocationID,IPIngressBytes,IPEgressBytes"}, units...)
+	raw, err := s.ctl(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, block := range strings.Split(strings.TrimSpace(raw), "\n\n") {
+		id, epoch := "", ""
+		for _, l := range strings.Split(block, "\n") {
+			k, v, _ := strings.Cut(l, "=")
+			if k == "Id" {
+				id = v
+			}
+			if k == "InvocationID" {
+				epoch = v
+			}
+		}
+		rx, tx, ok := parseIPAccounting(block)
+		if id != "" {
+			out[id] = AccountingReading{Rx: rx, Tx: tx, Epoch: epoch, Valid: ok && epoch != ""}
+		}
+	}
+	return out, nil
+}
+
+// Stop preserves unit accounting until the next invocation starts.
+func (s *Systemd) StopUnits(ctx context.Context, units []string) error {
+	if len(units) == 0 {
+		return nil
+	}
+	_, err := s.ctl(ctx, append([]string{"stop"}, units...)...)
+	return err
+}
+
+func (s *Systemd) StartUnits(ctx context.Context, units []string) error {
+	if len(units) == 0 {
+		return nil
+	}
+	_, err := s.ctl(ctx, append([]string{"start"}, units...)...)
+	return err
+}
+
+// SnellSlice stays active across child service restarts and preserves counters.
+func SnellSlice(nodeID int64) string { return fmt.Sprintf("ctlvps-proxy-n%d.slice", nodeID) }
+
+func (s *Systemd) EnsureSnellMeter(ctx context.Context, n agentproto.NodeSpec) (bool, error) {
+	if n.NodeID <= 0 {
+		return false, fmt.Errorf("invalid Snell node identity")
+	}
+	name := SnellSlice(n.NodeID)
+	changed, err := s.WriteUnit(name, "[Unit]\nDescription=VpsCT node accounting\n[Slice]\nIPAccounting=yes\n")
+	if err != nil {
+		return false, err
+	}
+	dropin, err := s.WriteUnit(SnellUnit(n.ListenPort)+".d/meter.conf", "[Service]\nSlice="+name+"\n")
+	if err != nil {
+		return false, err
+	}
+	if changed || dropin {
+		if err = s.DaemonReload(ctx); err != nil {
+			return false, err
+		}
+	}
+	return changed || dropin, s.StartUnits(ctx, []string{name})
+}
+
+// EnsureProxyBudget bounds the aggregate of all proxy processes, including
+// official Snell instances. The agent is deliberately outside this slice.
+func (s *Systemd) EnsureProxyBudget(ctx context.Context, t agentproto.Tuning) error {
+	limit := t.MemoryMaxMB
+	if limit <= 0 {
+		limit = 256
+	}
+	unit := fmt.Sprintf("[Unit]\nDescription=VpsCT proxy resource budget\n[Slice]\nMemoryAccounting=yes\nMemoryHigh=%dM\nMemoryMax=%dM\n", limit*3/4, limit)
+	changed, err := s.WriteUnit("ctlvps-proxy.slice", unit)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return s.DaemonReload(ctx)
+	}
+	return nil
+}
+
+func (s *Systemd) InSlice(ctx context.Context, unit, slice string) bool {
+	out, err := s.ctl(ctx, "show", unit, "--property=Slice", "--value")
+	return err == nil && strings.TrimSpace(out) == slice
+}
+
+// ControlGroup resolves an existing managed slice, never a panel-provided path.
+func (s *Systemd) ControlGroup(ctx context.Context, unit string) (string, error) {
+	out, e := s.ctl(ctx, "show", unit, "--property=ControlGroup", "--value")
+	if e != nil {
+		return "", e
+	}
+	g := strings.TrimSpace(out)
+	if !strings.HasPrefix(g, "/") || !strings.Contains(g, "ctlvps-proxy") {
+		return "", fmt.Errorf("managed cgroup unavailable")
+	}
+	return g, nil
+}
+
+// EmptySnellMeter refuses to retire a slice while any child still has tasks.
+// Unlike the port-named service, the slice identity cannot be reused by a new
+// node on the same listening port.
+func (s *Systemd) EmptySnellMeter(ctx context.Context, nodeID int64) error {
+	if nodeID <= 0 {
+		return fmt.Errorf("invalid meter ID")
+	}
+	g, err := s.ControlGroup(ctx, SnellSlice(nodeID))
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(g) != g || strings.Contains(g, "..") {
+		return fmt.Errorf("invalid managed cgroup")
+	}
+	raw, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", g, "cgroup.events"))
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "populated 0" {
+			return nil
+		}
+	}
+	return fmt.Errorf("retired Snell slice still populated")
+}
+func (s *Systemd) FinalSnellReading(ctx context.Context, nodeID int64) (AccountingReading, error) {
+	if err := s.EmptySnellMeter(ctx, nodeID); err != nil {
+		return AccountingReading{}, err
+	}
+	unit := SnellSlice(nodeID)
+	out, err := s.AccountingSnapshot(ctx, []string{unit})
+	if err != nil {
+		return AccountingReading{}, err
+	}
+	r := out[unit]
+	if !r.Valid {
+		return r, fmt.Errorf("final Snell counter unavailable")
+	}
+	return r, nil
+}
+func (s *Systemd) RemoveSnellMeter(ctx context.Context, nodeID int64) error {
+	if nodeID <= 0 {
+		return fmt.Errorf("invalid meter ID")
+	}
+	unit := SnellSlice(nodeID)
+	if s.IsActive(ctx, unit) {
+		if err := s.EmptySnellMeter(ctx, nodeID); err != nil {
+			return err
+		}
+		if err := s.StopUnits(ctx, []string{unit}); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(s.UnitDir, unit)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return s.DaemonReload(ctx)
 }

@@ -1,10 +1,11 @@
+import { ConfigStatusNotice, configurationState } from "@/components/config-status";
 import * as React from "react";
 import { MaintenancePanel } from "@/components/maintenance";
 import { ServerActions } from "@/components/server-actions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Copy, KeyRound, Plus, RefreshCw, Trash2, Pencil, Cpu, MemoryStick, Wifi, ShieldCheck, AlertTriangle, Wrench } from "lucide-react";
-import { del, get, post, put } from "@/lib/api";
+import { get, post, put } from "@/lib/api";
 import type { Server, Node, Series } from "@/lib/types";
 import { fmtBytes, fmtAgo, fmtDuration, fmtRate, gbToBytes, bytesToGb, parseResetDay, copyText, STATUS_LABELS, PROTOCOL_LABELS, fmtDate, defaultNodeName } from "@/lib/utils";
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Confirm, Dialog, Empty, Field, Input, PageHeader, Progress, Select, Spinner, Switch, Table, Td, Th, Tr, Textarea, Code, Pre, Tabs } from "@/components/ui";
@@ -161,7 +162,7 @@ export function ServersPage() {
                   <TrafficIO className="mt-1.5" compact inbound={s.usage?.inbound ?? s.usage?.up} outbound={s.usage?.outbound ?? s.usage?.down} />
                 </div>
                 {(s.desired && !s.desired.in_sync) || s.agent?.apply_error ? (
-                  <p className="mt-2 inline-flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"><AlertTriangle className="h-3 w-3" /> {s.agent?.apply_error || `配置待同步 (rev ${s.desired?.revision})`}</p>
+                  <p className="mt-2 inline-flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"><AlertTriangle className="h-3 w-3" /> {configurationState(s)?.title || "等待同步节点设置"}</p>
                 ) : null}
               </Card>
             </Link>
@@ -190,9 +191,21 @@ export function ServerDetailPage() {
   const toast = useToast();
   const { meta } = useAuth();
   const q = useQuery({ queryKey: ["servers", id], queryFn: () => get<Server>(`/api/v1/servers/${id}`), refetchInterval: 10000 });
-  const traffic = useQuery({ queryKey: ["servers", id, "traffic"], queryFn: () => get<Series>(`/api/v1/servers/${id}/traffic?days=30`) });
-  const samples = useQuery({ queryKey: ["servers", id, "samples"], queryFn: () => get<{ ts: string; rx_rate: number; tx_rate: number }[]>(`/api/v1/servers/${id}/samples?hours=24`), refetchInterval: 60000 });
+  const [trafficDays, setTrafficDays] = React.useState(30);
+  const [trafficSelection, setTrafficSelection] = React.useState({ serverID: id, nodeID: "server" });
   const nodes = useQuery({ queryKey: ["nodes", { server_id: id }], queryFn: () => get<Node[]>(`/api/v1/nodes?server_id=${id}&include_revoked=1`) });
+  const trafficNode = trafficSelection.serverID === id
+    ? nodes.data?.find((n) => String(n.id) === trafficSelection.nodeID)
+    : undefined;
+  const trafficSubject = trafficNode ? String(trafficNode.id) : "server";
+  const traffic = useQuery({
+    queryKey: ["servers", id, "traffic", trafficSubject, trafficDays],
+    queryFn: () => get<Series>(trafficNode
+      ? `/api/v1/nodes/${trafficNode.id}/traffic?days=${trafficDays}`
+      : `/api/v1/servers/${id}/traffic?days=${trafficDays}`),
+    refetchInterval: 30000,
+  });
+  const samples = useQuery({ queryKey: ["servers", id, "samples"], queryFn: () => get<{ ts: string; rx_rate: number; tx_rate: number }[]>(`/api/v1/servers/${id}/samples?hours=24`), refetchInterval: 60000 });
   const desired = useQuery({ queryKey: ["servers", id, "desired"], queryFn: () => get<Revision[]>(`/api/v1/servers/${id}/desired?limit=5`) });
   const [edit, setEdit] = React.useState(false);
   const [deploy, setDeploy] = React.useState(false);
@@ -205,7 +218,7 @@ export function ServerDetailPage() {
   const [maintenanceBusy, setMaintenanceBusy] = React.useState(false);
 
   const enrollM = useMutation({ mutationFn: () => post<{ token: string; install_command: string; expires_at: string }>(`/api/v1/servers/${id}/enroll-token`), onSuccess: setEnroll, onError: (e) => toast.fromError(e) });
-  const republish = useMutation({ mutationFn: () => post(`/api/v1/servers/${id}/republish`), onSuccess: () => { toast.success("已请求重新应用节点配置"); qc.invalidateQueries({ queryKey: ["servers", id] }); }, onError: (e) => toast.fromError(e) });
+  const republish = useMutation({ mutationFn: () => post(`/api/v1/servers/${id}/republish`), onSuccess: () => { toast.success("已重试，等待服务器同步"); qc.setQueryData<Server>(["servers", id], (old) => old?.desired ? { ...old, desired: { ...old.desired, in_sync: false, status: "pending", error: "" }, agent: old.agent ? { ...old.agent, apply_error: "" } : old.agent } : old); qc.invalidateQueries({ queryKey: ["servers", id] }); }, onError: (e) => toast.fromError(e) });
   const checkAgentUpdate = useMutation({
     mutationFn: () => post<{ queued?: boolean; manual?: boolean; message: string; agent_update?: { command?: string } }>(`/api/v1/servers/${id}/update-agent`),
     onSuccess: async (r) => {
@@ -219,7 +232,7 @@ export function ServerDetailPage() {
     },
     onError: (e) => toast.fromError(e),
   });
-  const delM = useMutation({ mutationFn: () => del(`/api/v1/servers/${id}`), onSuccess: () => { toast.success("已删除"); qc.invalidateQueries({ queryKey: ["servers"] }); nav("/servers"); }, onError: (e) => toast.fromError(e) });
+  const onServerDeleted = React.useCallback(() => { toast.success("服务器记录已删除"); void qc.invalidateQueries({ queryKey: ["servers"] }); void qc.invalidateQueries({ queryKey: ["nodes"] }); void qc.invalidateQueries({ queryKey: ["subscriptions"] }); nav("/servers"); }, [qc, nav]);
   const resetTok = useMutation({ mutationFn: () => post(`/api/v1/servers/${id}/reset-token`), onSuccess: () => { toast.success("已吊销 agent 令牌，需重新注册"); setConfirmReset(false); qc.invalidateQueries({ queryKey: ["servers", id] }); } });
 
   if (q.isLoading) return <Spinner />;
@@ -243,21 +256,20 @@ export function ServerDetailPage() {
             <ServerActions items={[
               { label: "agent 维护", icon: <Wrench className="h-4 w-4" />, onClick: () => setMaintenanceOpen(true) },
               ...(s.agent && !s.diagnostics?.maintenance ? [{ label: s.agent_update?.supported ? "检查 agent 更新" : "复制 agent 更新命令", icon: <Copy className="h-4 w-4" />, onClick: () => checkAgentUpdate.mutate(), disabled: checkAgentUpdate.isPending || maintenanceBusy }] : []),
-              { label: "重新应用节点配置", icon: <RefreshCw className="h-4 w-4" />, onClick: () => republish.mutate(), disabled: republish.isPending || maintenanceBusy },
               { label: "删除服务器记录", icon: <Trash2 className="h-4 w-4" />, onClick: () => setConfirmDel(true), disabled: maintenanceBusy, destructive: true },
             ]} />
           </>
         }
       />
 
-      <MaintenancePanel key={s.id} server={{ id: s.id, name: s.name }} open={maintenanceOpen} onOpen={() => setMaintenanceOpen(true)} onClose={() => setMaintenanceOpen(false)} onBusyChange={setMaintenanceBusy} />
+      <MaintenancePanel key={s.id} server={{ id: s.id, name: s.name }} open={maintenanceOpen} onOpen={() => setMaintenanceOpen(true)} onClose={() => setMaintenanceOpen(false)} onBusyChange={setMaintenanceBusy} deleteOpen={confirmDel} onDeleteClose={() => setConfirmDel(false)} onDeleted={onServerDeleted} />
 
-      {s.agent?.apply_error && (
-        <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/5 p-3 text-sm"><AlertTriangle className="mr-1 inline h-4 w-4 text-red-500" /> 配置下发失败：{s.agent.apply_error}</div>
-      )}
+      {s.agent && <div className="mb-4 rounded-md border p-3 text-sm">安全状态：{s.agent_status === "pending" ? "尚未接入 agent" : !s.diagnostics?.security_version ? "旧版 agent，尚未启用新版安全策略" : !s.diagnostics.security_policy ? "本机安全策略加载失败，程序与配置变更已关闭" : s.diagnostics.security_paused ? "本机已暂停配置变更" : "更新文件校验与本机安全策略已启用"}</div>}
+      {s.diagnostics?.metering_error && <div className="mb-4 rounded-md border border-red-500/40 p-3 text-sm text-destructive">节点流量采集异常：{s.diagnostics.metering_error}。当前用量可能未更新。</div>}
+      {!maintenanceBusy && <ConfigStatusNotice server={s} retrying={republish.isPending} disabled={maintenanceBusy} onRetry={() => republish.mutate()} onDetails={() => setTab("diag")} />}
       {s.agent && s.agent_update && !s.agent_update.supported && (
         <div className="mb-4 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
-          当前 agent 需手动更新一次。在「更多」中复制 agent 更新命令，在该 VPS 上执行后，即可随心跳自动同步控制端提供的版本。
+          请先在此 VPS 通过独立可信渠道配置验证器、签名根和本地安装器，再执行「更多」中的迁移命令。完成后只接受受信签名版本；未完成前不会自动更新。
         </div>
       )}
       {s.agent_update?.outdated && !s.diagnostics?.maintenance && (
@@ -275,8 +287,28 @@ export function ServerDetailPage() {
 
       <div className="mt-4 grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
-          <CardHeader><CardTitle>近 30 天流量（柱为入站/出站）</CardTitle></CardHeader>
-          <CardContent><TrafficBars points={traffic.data?.points ?? []} /></CardContent>
+          <CardHeader>
+            <CardTitle>服务器流量</CardTitle>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+              <Select aria-label="流量统计对象" value={trafficSubject} onChange={(e) => setTrafficSelection({ serverID: id, nodeID: e.target.value })}>
+                <option value="server">整台服务器</option>
+                {(nodes.data ?? []).map((n) => <option key={n.id} value={String(n.id)}>{n.name} · {PROTOCOL_LABELS[n.protocol] ?? n.protocol}{n.revoked ? "（已撤销）" : ""}</option>)}
+              </Select>
+              <Select aria-label="服务器流量时间范围" value={trafficDays} onChange={(e) => setTrafficDays(Number(e.target.value))}>
+                {[7, 30, 90].map((days) => <option key={days} value={days}>近 {days} 天</option>)}
+              </Select>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {traffic.isLoading ? <p className="text-sm text-muted-foreground">正在加载流量…</p>
+              : traffic.isError ? <p className="text-destructive">流量加载失败</p>
+              : traffic.data?.has_data ? <><TrafficIO inbound={traffic.data.total_up} outbound={traffic.data.total_down} /><TrafficBars points={traffic.data.points} /></>
+              : <p className="text-sm text-muted-foreground">暂无用量记录</p>}
+            <p className="text-xs text-muted-foreground">{trafficNode
+              ? "当前只显示所选节点的入站和出站流量。仅汇总已采集记录。"
+              : "服务器按网卡收发计量，包含 SSH、系统更新等流量，与节点合计不必相等。仅汇总已采集记录。"}</p>
+            {nodes.isError && <p className="mt-2 text-xs text-destructive">节点列表加载失败，暂时只能查看整台服务器。</p>}
+          </CardContent>
         </Card>
         <Card>
           <CardHeader><CardTitle>本期配额</CardTitle></CardHeader>
@@ -317,8 +349,8 @@ export function ServerDetailPage() {
             <Empty title="尚未部署节点" description="点击「部署节点」在这台服务器上创建 VLESS Reality、Hysteria2、Snell 等入口。" action={<Button onClick={() => setDeploy(true)}>部署节点</Button>} />
           ) : (
             <Table>
-              <thead><tr className="border-b"><Th>名称</Th><Th>协议</Th><Th>地址</Th><Th>归属</Th><Th>状态</Th><Th></Th></tr></thead>
-              <tbody>{nodes.data.map((n) => <NodeRow key={n.id} n={n} onOpen={() => setNodeDetail(n)} />)}</tbody>
+              <thead><tr className="border-b"><Th>名称</Th><Th>协议</Th><Th>地址</Th><Th>归属</Th><Th>近 30 天用量</Th><Th>状态</Th><Th></Th></tr></thead>
+              <tbody>{nodes.data.map((n) => <NodeRow key={n.id} n={n} onOpen={() => setNodeDetail(n)} configurationHint={!n.revoked && n.enabled ? configurationState(s, republish.isPending)?.title : undefined} />)}</tbody>
             </Table>
           )}
         </div>
@@ -418,7 +450,7 @@ export function ServerDetailPage() {
 
       <ServerDialog open={edit} onClose={() => setEdit(false)} server={s} />
       <DeployDialog open={deploy} onClose={() => setDeploy(false)} server={s} protocols={meta?.protocols ?? []} />
-      <Dialog open={!!enroll} onClose={() => setEnroll(null)} title="安装 agent" description="在目标 VPS 上以 root 执行以下命令（令牌 24 小时内有效，仅可使用一次）。">
+      <Dialog open={!!enroll} onClose={() => setEnroll(null)} title="安装 agent" description="先从独立可信发行渠道安装验证器、安装脚本和本机策略，再以 root 执行以下命令。令牌 15 分钟有效，仅可使用一次。">
         {enroll && (
           <div className="space-y-3">
             <Pre className="whitespace-pre-wrap break-all">{enroll.install_command}</Pre>
@@ -427,7 +459,6 @@ export function ServerDetailPage() {
           </div>
         )}
       </Dialog>
-      <Confirm open={confirmDel} onClose={() => setConfirmDel(false)} onConfirm={() => delM.mutate()} loading={delM.isPending} destructive title="删除服务器？" description="将删除该服务器及其部署节点的记录。VPS 上的 agent 将停止收到配置。" />
       <Confirm open={confirmReset} onClose={() => setConfirmReset(false)} onConfirm={() => resetTok.mutate()} destructive title="吊销 agent 令牌？" description="agent 将无法继续通信，需要重新生成安装命令并注册。" />
       <NodeDetailDialog node={nodeDetail} onClose={() => setNodeDetail(null)} />
     </div>
@@ -446,7 +477,7 @@ function Diag({ ok, label, warnOnly }: { ok: boolean; label: string; warnOnly?: 
 function DeployDialog({ open, onClose, server, protocols }: { open: boolean; onClose: () => void; server: Server; protocols: string[] }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const [f, setF] = React.useState({ protocol: "vless", name: "", port: "", sni: "", domain: "", obfs: false, snell_version: 4, cert_mode: "" });
+  const [f, setF] = React.useState({ protocol: "vless", name: "", port: "", sni: "", domain: "", obfs: false, snell_version: 4, cert_mode: "", cert_id: "" });
   const set = (k: string, v: unknown) => setF((p) => ({ ...p, [k]: v }));
   const m = useMutation({
     mutationFn: () => post<Node>(`/api/v1/servers/${server.id}/nodes`, { ...f, port: Number(f.port) || 0, snell_version: Number(f.snell_version) }),
@@ -479,6 +510,7 @@ function DeployDialog({ open, onClose, server, protocols }: { open: boolean; onC
             </Field>
           </>
         )}
+        {tls && (f.cert_mode || server.cert_mode) === "external" && <Field label="外部证书 ID" hint="填写此 VPS 本机安全策略中已登记的证书名称"><Input value={f.cert_id} onChange={(e) => set("cert_id", e.target.value)} maxLength={64} /></Field>}
         {f.protocol === "hysteria2" && <div className="sm:col-span-2"><Switch checked={f.obfs} onChange={(v) => set("obfs", v)} label="启用 Salamander 混淆（对抗 QUIC 封锁）" /></div>}
         {f.protocol === "snell" && (
           <Field label="Snell 版本">

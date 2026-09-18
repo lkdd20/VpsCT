@@ -5,7 +5,8 @@ set -euo pipefail
 ROLE='' PURGE=0 YES=0 DRY_RUN=0 REMOVE_CADDY=0
 ROOT='' # Only changed by sourced, isolated tests; never read from the environment.
 UNITS=() REMOVE=() KEEP=()
-NFT_PRESENT=0 CADDY_DOMAIN=''
+NFT_PRESENT=0 NFT_NODES_PRESENT=0 NFT_EGRESS_PRESENT=0 CADDY_DOMAIN=''
+NFT_INGRESS_HANDLES=()
 
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 info() { printf '==> %s\n' "$*"; }
@@ -58,9 +59,16 @@ parse_args() {
 safe_path() {
   local target=$1 parent mounts mount
   [[ "$target" == "$ROOT"/opt/ctlvps/* || "$target" == "$ROOT"/etc/ctlvps/* ||
+     "$target" == "$ROOT"/etc/ctlvps-proxy ||
+     "$target" == "$ROOT"/etc/systemd/system/ctlvps-proxy-guard.timer ||
      "$target" == "$ROOT"/etc/systemd/system/ctlvps*.service ||
+     "$target" == "$ROOT"/etc/systemd/system/ctlvps-proxy.slice ||
+     "$target" =~ ^"$ROOT"/etc/systemd/system/ctlvps-proxy-(n[0-9]+|public|private)\.slice$ ||
+     "$target" =~ ^"$ROOT"/etc/systemd/system/ctlvps-snell@[0-9]+\.service\.d/meter\.conf$ ||
+     "$target" == "$ROOT"/run/ctlvps-proxy ||
      "$target" == "$ROOT"/usr/local/bin/ctlvps-agent ||
-     "$target" == "$ROOT"/var/lib/ctlvps-agent || "$target" == "$ROOT"/var/log/ctlvps ||
+     "$target" == "$ROOT"/usr/local/libexec/ctlvps-agent-uninstall.sh ||
+     "$target" == "$ROOT"/var/lib/ctlvps-agent || "$target" == "$ROOT"/var/lib/ctlvps-proxy || "$target" == "$ROOT"/var/log/ctlvps ||
      "$target" == "$ROOT"/etc/caddy/Caddyfile ||
      "$target" == "$ROOT"/var/lib/caddy/.local/share/caddy/certificates/* ]] || die '拒绝清理范围外的路径'
   parent=${target%/*}
@@ -85,20 +93,32 @@ data_path() {
 }
 
 add_unit() {
-  local unit=$1 expected=${2:-} state fragment dropins start existing
+  local unit=$1 expected=${2:-} state fragment dropins start existing content pattern
   for existing in "${UNITS[@]}"; do [[ "$existing" != "$unit" ]] || return 0; done
-  [[ "$unit" =~ ^ctlvps(d|-agent|-maintenance|-singbox(@[0-9]*)?|-snell@[0-9]*)\.service$ || "$unit" == caddy.service ]] || die '服务名超出卸载范围'
+  [[ "$unit" =~ ^ctlvps(d|-agent|-maintenance|-proxy-guard|-singbox(-private|@[0-9]*)?|-snell@[0-9]*)\.service$ || "$unit" == ctlvps-proxy-guard.timer || "$unit" =~ ^ctlvps-proxy(-(n[0-9]+|public|private))?\.slice$ || "$unit" == caddy.service ]] || die '服务名超出卸载范围'
   state=$(systemctl show "$unit" -p LoadState --value) || die "无法读取服务：$unit"
   [[ "$state" != not-found ]] || return 0
   [[ "$state" == loaded || "$state" == masked ]] || die "服务状态异常：$unit"
   fragment=$(systemctl show "$unit" -p FragmentPath --value) || die "无法读取服务路径：$unit"
   dropins=$(systemctl show "$unit" -p DropInPaths --value) || die "无法读取服务覆盖配置：$unit"
-  [[ -z "$dropins" ]] || die "$unit 有 systemd 覆盖配置，请手动处理"
+  if [[ -n "$dropins" ]]; then
+    [[ "$unit" =~ ^ctlvps-snell@[0-9]+\.service$ && "$dropins" == "/etc/systemd/system/$unit.d/meter.conf" ]] || die "$unit 有自定义 systemd 覆盖配置，请手动处理"
+    content=$(cat "$(path "$dropins")") || die '无法读取节点计量配置'
+    pattern=$'^\[Service\]\nSlice=ctlvps-proxy-n[0-9]+\.slice$'
+    [[ "$content" =~ $pattern ]] || die '节点计量覆盖配置不是安装器生成的内容'
+    add_remove "$(path "$dropins")"
+  fi
   if [[ "$unit" != caddy.service ]]; then
-    [[ "$fragment" == /etc/systemd/system/ctlvps*.service || "$fragment" == /dev/null ]] || die "$unit 不在默认服务目录"
+    [[ "$fragment" == /etc/systemd/system/ctlvps*.service || "$fragment" == /etc/systemd/system/ctlvps-proxy-guard.timer || "$fragment" == /etc/systemd/system/ctlvps-proxy*.slice || "$fragment" == /dev/null ]] || die "$unit 不在默认服务目录"
   fi
   if [[ -n "$expected" && "$state" != masked ]]; then
     start=$(systemctl show "$unit" -p ExecStart --value) || die "无法读取启动命令：$unit"
+    case "$unit" in
+      ctlvps-singbox.service) [[ "$start" != *"argv[]=/usr/local/bin/ctlvps-agent proxy-exec singbox run public ;"* ]] || expected='/usr/local/bin/ctlvps-agent proxy-exec singbox run public' ;;
+      ctlvps-snell@*) [[ "$start" != *"argv[]=/usr/local/bin/ctlvps-agent proxy-exec snell run ${unit#*@}"* ]] || :
+        local proxy_port=${unit#*@}; proxy_port=${proxy_port%.service}
+        [[ "$start" != *"argv[]=/usr/local/bin/ctlvps-agent proxy-exec snell run $proxy_port ;"* ]] || expected="/usr/local/bin/ctlvps-agent proxy-exec snell run $proxy_port" ;;
+    esac
     [[ "$start" == *"argv[]=$expected ;"* ]] || die "$unit 使用自定义启动参数或路径，请手动处理"
   fi
   UNITS+=("$unit")
@@ -106,6 +126,8 @@ add_unit() {
 
 plan_agent() {
   local listed files status unit rest file name expected port
+  add_unit ctlvps-proxy-guard.timer
+  add_unit ctlvps-proxy-guard.service '/usr/local/bin/ctlvps-agent proxy-guard'
   add_unit ctlvps-agent.service '/usr/local/bin/ctlvps-agent run --state /var/lib/ctlvps-agent'
   listed=$(systemctl list-units --all --plain --no-legend --no-pager 'ctlvps-singbox*' 'ctlvps-snell*') || die '无法枚举节点服务'
   if files=$(systemctl list-unit-files --no-legend --no-pager 'ctlvps-singbox*' 'ctlvps-snell*'); then
@@ -118,18 +140,19 @@ plan_agent() {
   listed+=$'\n'"$files"
   while read -r unit rest; do
     [[ -n "$unit" ]] || continue
-    [[ "$unit" =~ ^ctlvps-(singbox|snell)(@[0-9]*)?\.service$ ]] || die "发现非标准节点服务：$unit"
+    [[ "$unit" =~ ^ctlvps-(singbox|snell)(-private|@[0-9]*)?\.service$ ]] || die "发现非标准节点服务：$unit"
     # Templates themselves have no running process.
     [[ "$unit" != *@.service ]] || continue
     port=${unit#*@}; port=${port%.service}
     case "$unit" in
+      ctlvps-singbox-private.service) expected='/usr/local/bin/ctlvps-agent proxy-exec singbox run private' ;;
       ctlvps-singbox.service) expected='/opt/ctlvps/bin/sing-box run -c /etc/ctlvps/sing-box.json' ;;
       ctlvps-singbox@*) expected="/opt/ctlvps/bin/sing-box run -c /etc/ctlvps/sing-box/$port.json" ;;
       ctlvps-snell@*) expected="/opt/ctlvps/bin/snell-server -c /etc/ctlvps/snell/$port.conf" ;;
     esac
     add_unit "$unit" "$expected"
   done <<< "$listed"
-  for name in ctlvps-agent.service ctlvps-singbox.service ctlvps-singbox@.service ctlvps-snell@.service; do
+  for name in ctlvps-proxy-guard.timer ctlvps-proxy-guard.service ctlvps-proxy.slice ctlvps-agent.service ctlvps-singbox.service ctlvps-singbox-private.service ctlvps-singbox@.service ctlvps-snell@.service; do
     add_remove "$(path /etc/systemd/system)/$name"
   done
   for file in "$(path /etc/systemd/system)"/ctlvps-singbox@*.service "$(path /etc/systemd/system)"/ctlvps-snell@*.service; do
@@ -138,16 +161,39 @@ plan_agent() {
     [[ "$name" =~ ^ctlvps-(singbox|snell)@[0-9]*\.service$ ]] || die "发现非标准节点服务文件：$name"
     add_remove "$file"
   done
-  add_remove "$(path /usr/local/bin/ctlvps-agent)"
-  for name in sing-box snell-server; do
-    for file in "$name" "$name.version" "$name.tmp"; do add_remove "$(path /opt/ctlvps/bin)/$file"; done
+  for file in "$(path /etc/systemd/system)"/ctlvps-proxy*.slice; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    name=${file##*/}
+    [[ "$name" =~ ^ctlvps-proxy(-(n[0-9]+|public|private))?\.slice$ ]] || die '非标准代理资源 slice'
+    add_unit "$name"
+    add_remove "$file"
   done
-  for file in /etc/ctlvps/sing-box /etc/ctlvps/sing-box.json /etc/ctlvps/snell /var/lib/ctlvps-agent /var/log/ctlvps; do
+  add_remove "$(path /run/ctlvps-proxy)"
+  add_remove "$(path /usr/local/bin/ctlvps-agent)"
+  if [[ "$PURGE" -eq 1 ]]; then add_remove "$(path /usr/local/libexec/ctlvps-agent-uninstall.sh)"; fi
+  for name in sing-box snell-server; do
+    for file in "$name" "$name.version" "$name.trusted" "$name.tmp"; do add_remove "$(path /opt/ctlvps/bin)/$file"; done
+  done
+  for file in /etc/ctlvps/sing-box /etc/ctlvps/sing-box.json /etc/ctlvps/snell /etc/ctlvps/proxy /etc/ctlvps-proxy /var/lib/ctlvps-proxy /var/lib/ctlvps-agent /var/log/ctlvps; do
     data_path "$(path "$file")"
   done
   if command -v nft >/dev/null; then
     listed=$(nft list tables) || die '无法检查 nftables，尚未停服或删除文件'
-    if [[ "$listed" == *'table inet ctlvps'* ]]; then NFT_PRESENT=1; fi
+    while read -r kind family table extra; do
+      [[ "$kind" == table && "$family" == inet && -z "$extra" ]] || continue
+      [[ "$table" != ctlvps ]] || NFT_PRESENT=1
+      [[ "$table" != ctlvps_nodes ]] || NFT_NODES_PRESENT=1
+      [[ "$table" != ctlvps_egress ]] || NFT_EGRESS_PRESENT=1
+    done <<< "$listed"
+    local ingress line handle
+    if ingress=$(nft -a list chain inet filter input 2>/dev/null); then
+      while IFS= read -r line; do
+        [[ "$line" == *'comment "ctlvps-node-ingress:'* ]] || continue
+        handle=${line##*# handle }
+        [[ "$handle" =~ ^[0-9]+$ ]] || die '节点端口规则句柄无效'
+        NFT_INGRESS_HANDLES+=("$handle")
+      done <<< "$ingress"
+    fi
   fi
 }
 
@@ -164,7 +210,7 @@ plan_controller() {
   for file in /etc/systemd/system/ctlvpsd.service /etc/systemd/system/ctlvps-maintenance.service /opt/ctlvps/current /opt/ctlvps/ctlvpsd /opt/ctlvps/agents /opt/ctlvps/uninstall.sh /opt/ctlvps/releases /opt/ctlvps/REPOSITORY; do
     add_remove "$(path "$file")"
   done
-  for file in /etc/ctlvps/ctlvpsd.env /opt/ctlvps/data /opt/ctlvps/backups; do data_path "$(path "$file")"; done
+  for file in /etc/ctlvps/ctlvpsd.env /etc/ctlvps/secrets.key /opt/ctlvps/data /opt/ctlvps/backups; do data_path "$(path "$file")"; done
 }
 
 plan_caddy() {
@@ -195,7 +241,8 @@ plan_caddy() {
 }
 
 plan() {
-  UNITS=() REMOVE=() KEEP=() NFT_PRESENT=0
+  UNITS=() REMOVE=() KEEP=() NFT_PRESENT=0 NFT_NODES_PRESENT=0 NFT_EGRESS_PRESENT=0
+  NFT_INGRESS_HANDLES=()
   agent && plan_agent
   controller && plan_controller
   plan_caddy
@@ -203,12 +250,15 @@ plan() {
   if [[ ${#UNITS[@]} -gt 0 ]]; then printf '停止并禁用：\n'; printf '  %s\n' "${UNITS[@]}"; fi
   printf '删除（不存在的路径将跳过）：\n'; printf '  %s\n' "${REMOVE[@]}"
   if [[ ${#KEEP[@]} -gt 0 ]]; then printf '保留：\n'; printf '  %s\n' "${KEEP[@]}"; fi
+  [[ ${#NFT_INGRESS_HANDLES[@]} == 0 ]] || printf '删除 VpsCT 自动开放的节点端口规则（保留其他入站规则）\n'
+  [[ "$NFT_EGRESS_PRESENT" == 0 ]] || printf "删除 nftables 表：inet ctlvps_egress\n"
+  [[ "$NFT_NODES_PRESENT" == 0 ]] || printf '删除 nftables 表：inet ctlvps_nodes（不修改其他表）\n'
   [[ "$NFT_PRESENT" == 0 ]] || printf '删除 nftables 表：inet ctlvps（不修改其他表）\n'
   return 0
 }
 
 execute_plan() {
-  local unit file before
+  local unit file before handle
   # Stop all services successfully before deleting anything. Agent must go first
   # so it cannot recreate core services or re-download their executables.
   for unit in "${UNITS[@]}"; do
@@ -220,6 +270,11 @@ execute_plan() {
     fi
     systemctl disable "$unit" || die "禁用 $unit 失败，尚未删除文件"
   done
+  for handle in "${NFT_INGRESS_HANDLES[@]}"; do
+    nft delete rule inet filter input handle "$handle" || die "清理节点端口规则失败"
+  done
+  [[ "$NFT_EGRESS_PRESENT" == 0 ]] || nft delete table inet ctlvps_egress || die "清理代理出站表失败"
+  [[ "$NFT_NODES_PRESENT" == 0 ]] || nft delete table inet ctlvps_nodes || die '清理节点计量表失败，尚未删除文件'
   [[ "$NFT_PRESENT" == 0 ]] || nft delete table inet ctlvps || die '清理项目计量表失败，尚未删除文件'
   for file in "${REMOVE[@]}"; do
     safe_path "$file"

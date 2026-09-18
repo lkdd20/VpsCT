@@ -64,11 +64,15 @@ type Metrics struct {
 
 // PortCounter is a cumulative nftables counter for one listening port.
 type PortCounter struct {
-	Port   int   `json:"port"`
-	Rx     int64 `json:"rx"` // VPS inbound for this inbound (client + origin)
-	Tx     int64 `json:"tx"` // VPS outbound for this inbound (client + origin)
-	RxPkts int64 `json:"rx_pkts,omitempty"`
-	TxPkts int64 `json:"tx_pkts,omitempty"`
+	NodeID   int64  `json:"node_id,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Epoch    string `json:"epoch,omitempty"`
+	FromZero bool   `json:"from_zero,omitempty"`
+	Port     int    `json:"port"`
+	Rx       int64  `json:"rx"` // VPS inbound for this inbound (client + origin)
+	Tx       int64  `json:"tx"` // VPS outbound for this inbound (client + origin)
+	RxPkts   int64  `json:"rx_pkts,omitempty"`
+	TxPkts   int64  `json:"tx_pkts,omitempty"`
 }
 
 // CoreStatus describes one proxy core process.
@@ -96,51 +100,59 @@ type CertStatus struct {
 
 // Diagnostics is the health section of a heartbeat.
 type Diagnostics struct {
-	Maintenance   int          `json:"maintenance,omitempty"`
-	Cores         []CoreStatus `json:"cores"`
-	Certs         []CertStatus `json:"certs,omitempty"`
-	ClockSkewMs   int64        `json:"clock_skew_ms"`
-	BBR           bool         `json:"bbr"`
-	CongestionCtl string       `json:"congestion_ctl"`
-	IPv6Reachable bool         `json:"ipv6_reachable"`
-	IPv4Reachable bool         `json:"ipv4_reachable"`
-	OOMEvents     int          `json:"oom_events"`
-	Nftables      bool         `json:"nftables"`
-	Systemd       bool         `json:"systemd"`
-	TimeSync      bool         `json:"time_sync"`
-	Warnings      []string     `json:"warnings,omitempty"`
-	RecentErrors  []string     `json:"recent_errors,omitempty"`
-	ConnlogLag    int64        `json:"connlog_lag"` // buffered events not yet uploaded
-	BinarySHA256  string       `json:"binary_sha256,omitempty"`
+	SecurityVersion int          `json:"security_version,omitempty"`
+	SecurityPolicy  bool         `json:"security_policy,omitempty"`
+	SecurityPaused  bool         `json:"security_paused,omitempty"`
+	MeteringError   string       `json:"metering_error,omitempty"`
+	Maintenance     int          `json:"maintenance,omitempty"`
+	Cores           []CoreStatus `json:"cores"`
+	Certs           []CertStatus `json:"certs,omitempty"`
+	ClockSkewMs     int64        `json:"clock_skew_ms"`
+	BBR             bool         `json:"bbr"`
+	CongestionCtl   string       `json:"congestion_ctl"`
+	IPv6Reachable   bool         `json:"ipv6_reachable"`
+	IPv4Reachable   bool         `json:"ipv4_reachable"`
+	OOMEvents       int          `json:"oom_events"`
+	Nftables        bool         `json:"nftables"`
+	Systemd         bool         `json:"systemd"`
+	TimeSync        bool         `json:"time_sync"`
+	Warnings        []string     `json:"warnings,omitempty"`
+	RecentErrors    []string     `json:"recent_errors,omitempty"`
+	ConnlogLag      int64        `json:"connlog_lag"` // buffered events not yet uploaded
+	BinarySHA256    string       `json:"binary_sha256,omitempty"`
 }
 
 // Heartbeat is sent every poll interval.
 type Heartbeat struct {
-	Version         string        `json:"version"`
-	BinarySHA256    string        `json:"binary_sha256,omitempty"`
-	Epoch           string        `json:"epoch"` // changes when counters reset; ingest rebases if NIC did not reset
-	TS              time.Time     `json:"ts"`
-	PublicIPv4      string        `json:"public_ipv4"`
-	PublicIPv6      string        `json:"public_ipv6"`
-	Metrics         Metrics       `json:"metrics"`
-	Ports           []PortCounter `json:"ports"`
-	AppliedRevision int64         `json:"applied_revision"`
-	AppliedHash     string        `json:"applied_hash"`
-	ApplyStatus     string        `json:"apply_status"` // applied|failed|pending
-	ApplyError      string        `json:"apply_error,omitempty"`
-	Diagnostics     Diagnostics   `json:"diagnostics"`
+	FinalMeters     *MeterSettlement `json:"final_meters,omitempty"`
+	Version         string           `json:"version"`
+	BinarySHA256    string           `json:"binary_sha256,omitempty"`
+	Epoch           string           `json:"epoch"` // changes when counters reset; ingest rebases if NIC did not reset
+	TS              time.Time        `json:"ts"`
+	PublicIPv4      string           `json:"public_ipv4"`
+	PublicIPv6      string           `json:"public_ipv6"`
+	Metrics         Metrics          `json:"metrics"`
+	Ports           []PortCounter    `json:"ports"`
+	AppliedRevision int64            `json:"applied_revision"`
+	AppliedHash     string           `json:"applied_hash"`
+	ApplyStatus     string           `json:"apply_status"` // applied|failed|pending
+	ApplyError      string           `json:"apply_error,omitempty"`
+	Diagnostics     Diagnostics      `json:"diagnostics"`
 }
 
 // HeartbeatResponse tells the agent what to do next.
 type HeartbeatResponse struct {
-	Maintenance     *MaintenanceCommand `json:"maintenance,omitempty"`
-	ServerTime      time.Time           `json:"server_time"`
-	DesiredRevision int64               `json:"desired_revision"`
-	DesiredHash     string              `json:"desired_hash"`
-	PollIntervalSec int                 `json:"poll_interval_sec"`
-	ConnlogEnabled  bool                `json:"connlog_enabled"`
-	CounterReset    bool                `json:"counter_reset"` // server lost baseline; agent may reset
-	AgentUpdate     *AgentUpdateSpec    `json:"agent_update,omitempty"`
+	FinalMeterVersion int                 `json:"final_meter_version,omitempty"`
+	FinalMeterAck     string              `json:"final_meter_ack,omitempty"`
+	MeteringVersion   int                 `json:"metering_version,omitempty"`
+	Maintenance       *MaintenanceCommand `json:"maintenance,omitempty"`
+	ServerTime        time.Time           `json:"server_time"`
+	DesiredRevision   int64               `json:"desired_revision"`
+	DesiredHash       string              `json:"desired_hash"`
+	PollIntervalSec   int                 `json:"poll_interval_sec"`
+	ConnlogEnabled    bool                `json:"connlog_enabled"`
+	CounterReset      bool                `json:"counter_reset"` // server lost baseline; agent may reset
+	AgentUpdate       *AgentUpdateSpec    `json:"agent_update,omitempty"`
 }
 
 type MaintenanceCommand struct {
@@ -158,7 +170,8 @@ type AgentUpdateSpec struct {
 
 // CertSpec tells the agent how to obtain the TLS certificate for a node.
 type CertSpec struct {
-	Mode     string `json:"mode"` // self_signed | acme | external
+	ID       string `json:"id,omitempty"` // local certificate registration, never an arbitrary path
+	Mode     string `json:"mode"`         // self_signed | acme | external
 	Domain   string `json:"domain"`
 	CertPath string `json:"cert_path,omitempty"` // external
 	KeyPath  string `json:"key_path,omitempty"`
@@ -167,6 +180,8 @@ type CertSpec struct {
 
 // NodeSpec is one inbound the agent must serve.
 type NodeSpec struct {
+	AllowPrivate   bool           `json:"-"` // resolved only from root-owned local policy
+	Retired        bool           `json:"-"` // local accounting tombstone, never an inbound
 	NodeID         int64          `json:"node_id"`
 	Name           string         `json:"name"`
 	Protocol       string         `json:"protocol"`
@@ -213,7 +228,7 @@ type ConnlogSpec struct {
 // Tuning are host-level knobs applied idempotently.
 type Tuning struct {
 	EnableBBR    bool `json:"enable_bbr"`
-	MemoryMaxMB  int  `json:"memory_max_mb"` // per core process
+	MemoryMaxMB  int  `json:"memory_max_mb"` // aggregate proxy slice budget, also an individual safety ceiling
 	LimitNOFILE  int  `json:"limit_nofile"`
 	Chrony       bool `json:"chrony"`
 	RestartSec   int  `json:"restart_sec"`

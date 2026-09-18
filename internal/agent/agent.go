@@ -3,12 +3,16 @@ package agent
 import (
 	"context"
 	"crypto/rand"
+	"ctlvps/internal/agentbudget"
+	"ctlvps/internal/agentwork"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +22,8 @@ import (
 	"ctlvps/internal/core"
 	"ctlvps/internal/diag"
 	"ctlvps/internal/nft"
+	"ctlvps/internal/proxyguard"
+	"ctlvps/internal/secureupdate"
 )
 
 // Agent is the long-running process.
@@ -28,13 +34,19 @@ type Agent struct {
 	Logger   *slog.Logger
 	Version  string
 
-	Paths   core.Paths
-	Systemd *core.Systemd
-	NFT     *nft.Manager
-	Drivers map[string]core.Driver
-	Metrics *MetricsCollector
-	Tail    *conntail.Tailer
+	Paths       core.Paths
+	Systemd     *core.Systemd
+	NFT         *nft.Manager
+	Drivers     map[string]core.Driver
+	Metrics     *MetricsCollector
+	Tail        *conntail.Tailer
+	PrivateTail *conntail.Tailer
 
+	retirementHost RetirementHost
+	finalMeters    bool
+	HoldUpdates    bool // locally pin a canary; pauses binary synchronization and web maintenance
+
+	stateMu     sync.Mutex // serializes the main loop and connlog state persistence
 	mu          sync.Mutex
 	desired     *agentproto.DesiredState
 	lastDiag    diag.Host
@@ -47,6 +59,7 @@ type Agent struct {
 
 // New wires the agent for a state directory.
 func New(stateDir string, st *State, logger *slog.Logger, version string) *Agent {
+	debug.SetMemoryLimit(agentbudget.ResidentGoBytes)
 	paths := core.DefaultPaths(stateDir)
 	sd := core.NewSystemd()
 	a := &Agent{
@@ -56,6 +69,7 @@ func New(stateDir string, st *State, logger *slog.Logger, version string) *Agent
 		Metrics: NewMetricsCollector(),
 		bootID:  BootID(),
 	}
+	a.retirementHost = retirementHost{a}
 	a.Drivers = map[string]core.Driver{
 		"singbox": core.NewSingBox(paths, sd),
 		"snell":   core.NewSnell(paths, sd),
@@ -84,6 +98,12 @@ func New(stateDir string, st *State, logger *slog.Logger, version string) *Agent
 		}
 		return false
 	}
+	a.PrivateTail = conntail.New(filepath.Join(paths.LogDir, "sing-box-private.log"))
+	a.PrivateTail.Enabled = a.Tail.Enabled
+	a.PrivateTail.Allowed = a.Tail.Allowed
+	queue := conntail.NewSharedQueue()
+	a.Tail.Queue = queue
+	a.PrivateTail.Queue = queue
 	return a
 }
 
@@ -118,7 +138,7 @@ func nonce() string {
 
 // Run executes the main loop until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
-	interval := time.Duration(a.State.PollIntervalSec) * time.Second
+	interval := time.Duration(max(10, min(300, a.State.PollIntervalSec))) * time.Second
 	if interval <= 0 {
 		interval = agentproto.DefaultPollIntervalSec * time.Second
 	}
@@ -127,22 +147,28 @@ func (a *Agent) Run(ctx context.Context) error {
 		_ = a.State.Save(a.StateDir)
 	}
 	// nft table missing (fresh boot) -> counters restart from zero: new epoch
-	if a.NFT.Available(ctx) && !a.NFT.Exists(ctx) {
+	if a.NFT.Available(ctx) && ((a.State.MeteringV1 && !a.NFT.NodesExist(ctx)) || (!a.State.MeteringV1 && !a.NFT.Exists(ctx))) {
 		a.State.CounterNonce = nonce()
 		_ = a.State.Save(a.StateDir)
 	}
+	a.stateMu.Lock()
 	go a.Tail.Run(ctx)
+	go a.PrivateTail.Run(ctx)
 	go a.connlogLoop(ctx)
 
 	// always apply once on start so a self-update can rewrite units
 	if a.maintenanceAction() != "uninstall" {
 		a.converge(ctx, true)
 	}
+	a.stateMu.Unlock()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	backoff := time.Second
 	for {
-		if err := a.heartbeat(ctx); err != nil {
+		a.stateMu.Lock()
+		err := a.heartbeat(ctx)
+		a.stateMu.Unlock()
+		if err != nil {
 			if errors.Is(err, ErrUnauthorized) {
 				a.Logger.Error("token rejected; waiting for re-enrolment", "err", err)
 			} else {
@@ -168,59 +194,232 @@ func (a *Agent) Run(ctx context.Context) error {
 // epoch identifies the current counter baseline.
 func (a *Agent) epoch() string { return a.bootID + ":" + a.State.CounterNonce }
 
-// portCounters is VPS in/out per listen port.
-// Prefers systemd IPAccounting (the process cgroup: client + origin).
-// nft listen-port counters are only a fallback before the unit is ready.
-func (a *Agent) portCounters(ctx context.Context) []agentproto.PortCounter {
-	byPort := map[int]agentproto.PortCounter{}
-	if a.NFT != nil && a.NFT.Available(ctx) {
-		if counters, err := a.NFT.Read(ctx); err == nil {
-			byPort = counters
+// portCounters includes retired identities until their final counters are
+// acknowledged. Accounting lives outside the service lifetime.
+func (a *Agent) portCounters(ctx context.Context) ([]agentproto.PortCounter, error) {
+	var out []agentproto.PortCounter
+	if a.NFT.NodesExist(ctx) {
+		counters, err := a.NFT.ReadNodes(ctx)
+		if err != nil {
+			return nil, err
 		}
+		for j := range counters {
+			counters[j].Epoch = a.epoch() + ":nft-node-v1"
+			for _, n := range a.State.MeterNodes {
+				if n.NodeID == counters[j].NodeID {
+					counters[j].Epoch = a.meterEpoch(n)
+					break
+				}
+			}
+		}
+		out = append(out, counters...)
+	} else if a.State.MeteringV1 {
+		return nil, fmt.Errorf("node accounting table missing")
 	}
-	a.mu.Lock()
-	ds := a.desired
-	a.mu.Unlock()
-	if ds != nil && a.Systemd != nil {
-		for _, n := range ds.Nodes {
-			if n.ListenPort <= 0 {
+	units := []string{}
+	byUnit := map[string]MeterIdentity{}
+	for _, n := range a.State.MeterNodes {
+		if n.Core != "snell" {
+			continue
+		}
+		u := core.SnellSlice(n.NodeID)
+		if !a.Systemd.IsActive(ctx, u) {
+			if a.State.MeteringV1 && a.Systemd.IsActive(ctx, core.SnellUnit(n.Port)) {
+				return nil, fmt.Errorf("Snell accounting slice unavailable")
+			}
+			continue
+		}
+		units = append(units, u)
+		byUnit[u] = n
+	}
+	readings, err := a.Systemd.AccountingSnapshot(ctx, units)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range units {
+		r := readings[u]
+		if !r.Valid {
+			return nil, fmt.Errorf("accounting unavailable for %s", u)
+		}
+		n := byUnit[u]
+		out = append(out, agentproto.PortCounter{NodeID: n.NodeID, Port: n.Port, Source: "systemd-v1", Epoch: r.Epoch, Rx: r.Rx, Tx: r.Tx, FromZero: true})
+	}
+	if !a.State.MeteringV1 && a.State.LegacySettled {
+		for _, n := range a.State.MeterNodes {
+			u := core.SingBoxUnit(n.Port)
+			if n.Core == "snell" {
+				u = core.SnellUnit(n.Port)
+				if a.Systemd.InSlice(ctx, u, core.SnellSlice(n.NodeID)) {
+					continue
+				}
+			}
+			if !a.Systemd.IsActive(ctx, u) {
 				continue
 			}
-			var unit string
-			switch n.Core {
-			case "snell":
-				unit = core.SnellUnit(n.ListenPort)
-			case "singbox":
-				unit = core.SingBoxUnit(n.ListenPort)
-			default:
-				continue
+			r, e := a.Systemd.AccountingSnapshot(ctx, []string{u})
+			if e != nil {
+				return nil, e
 			}
-			in, out, ok := a.Systemd.IPAccounting(ctx, unit)
-			if !ok {
-				continue
+			v := r[u]
+			if !v.Valid {
+				return nil, fmt.Errorf("legacy accounting unavailable")
 			}
-			pc := byPort[n.ListenPort]
-			pc.Port = n.ListenPort
-			pc.Rx, pc.Tx = in, out
-			byPort[n.ListenPort] = pc
+			out = append(out, agentproto.PortCounter{NodeID: n.NodeID, Port: n.Port, Source: "systemd-legacy-v1", Epoch: v.Epoch, Rx: v.Rx, Tx: v.Tx, FromZero: true})
 		}
 	}
-	out := make([]agentproto.PortCounter, 0, len(byPort))
-	for _, c := range byPort {
-		if c.Port > 0 {
-			out = append(out, c)
+	return out, nil
+}
+
+// flushSettlement retries the exact durable snapshot, never a newly sampled
+// value. Baselines and usage are committed together by the controller.
+func (a *Agent) flushSettlement(ctx context.Context) error {
+	if a.State.PendingSettlement == nil {
+		return nil
+	}
+	resp, err := a.Client.Heartbeat(ctx, *a.State.PendingSettlement)
+	if err != nil {
+		return fmt.Errorf("legacy meter settlement: %w", err)
+	}
+	if resp.MeteringVersion < 1 {
+		return fmt.Errorf("upgrade controller before migrating node accounting")
+	}
+	pending := a.State.PendingSettlement
+	a.State.PendingSettlement = nil
+	a.State.LegacySettled = true
+	if err := a.State.Save(a.StateDir); err != nil {
+		a.State.PendingSettlement = pending
+		return err
+	}
+	return nil
+}
+
+// prepareMetering stops legacy services before reading their retained final
+// counters. Failure restores their availability; a durable report survives a
+// lost acknowledgment and prevents double billing on retry.
+func (a *Agent) prepareMetering(ctx context.Context, ds *agentproto.DesiredState) (func(bool), error) {
+	if err := a.flushSettlement(ctx); err != nil {
+		return nil, err
+	}
+	if a.State.MeteringV1 {
+		return func(bool) {}, nil
+	}
+	identities := map[string]agentproto.NodeSpec{}
+	for _, n := range ds.Nodes {
+		u := core.SingBoxUnit(n.ListenPort)
+		if n.Core == "snell" {
+			u = core.SnellUnit(n.ListenPort)
+		}
+		identities[u] = n
+	}
+	for _, n := range a.State.MeterNodes {
+		u := core.SingBoxUnit(n.Port)
+		if n.Core == "snell" {
+			u = core.SnellUnit(n.Port)
+		}
+		if _, ok := identities[u]; !ok {
+			identities[u] = agentproto.NodeSpec{NodeID: n.NodeID, ListenPort: n.Port, Core: n.Core}
 		}
 	}
-	return out
+	for _, pattern := range []string{"ctlvps-singbox@*.service", "ctlvps-snell@*.service"} {
+		for _, u := range a.Systemd.ListUnits(ctx, pattern) {
+			if _, ok := identities[u]; !ok && a.Systemd.IsActive(ctx, u) {
+				return nil, fmt.Errorf("cannot settle unknown legacy service %s; reconcile its node identity first", u)
+			}
+		}
+	}
+	active := []string{}
+	for u := range identities {
+		if n := identities[u]; n.Core == "snell" && a.Systemd.InSlice(ctx, u, core.SnellSlice(n.NodeID)) {
+			continue
+		}
+		if a.Systemd.IsActive(ctx, u) {
+			active = append(active, u)
+		}
+	}
+	restore := func(success bool) {
+		if success {
+			return
+		}
+		c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		// No legacy process may run under the new sing-box counters: its
+		// process counters already include the same client packets.
+		if !a.Systemd.IsActive(c, "ctlvps-singbox.service") && a.NFT.NodesExist(c) {
+			if err := a.NFT.EnsureNodes(c, nil); err != nil {
+				a.Logger.Error("restore accounting rules", "err", err)
+				return
+			}
+		}
+		for _, u := range active {
+			if strings.HasPrefix(u, "ctlvps-singbox@") && a.Systemd.IsActive(c, "ctlvps-singbox.service") {
+				continue
+			}
+			_ = a.Systemd.StartUnits(c, []string{u})
+		}
+	}
+	if err := a.Systemd.StopUnits(ctx, active); err != nil {
+		restore(false)
+		return nil, err
+	}
+	readings, err := a.Systemd.AccountingSnapshot(ctx, active)
+	if err != nil {
+		restore(false)
+		return nil, err
+	}
+	hb := agentproto.Heartbeat{Version: a.Version, Epoch: a.epoch(), TS: time.Now().UTC(), Metrics: a.Metrics.Collect()}
+	for _, u := range active {
+		n, r := identities[u], readings[u]
+		if !r.Valid {
+			restore(false)
+			return nil, fmt.Errorf("legacy accounting unavailable for %s", u)
+		}
+		if !a.State.LegacySettled {
+			hb.Ports = append(hb.Ports, agentproto.PortCounter{Port: n.ListenPort, Rx: r.Rx, Tx: r.Tx})
+		}
+		hb.Ports = append(hb.Ports, agentproto.PortCounter{NodeID: n.NodeID, Port: n.ListenPort, Source: "systemd-legacy-v1", Epoch: r.Epoch, Rx: r.Rx, Tx: r.Tx, FromZero: a.State.LegacySettled})
+	}
+	a.State.PendingSettlement = &hb
+	if err = a.State.Save(a.StateDir); err != nil {
+		restore(false)
+		return nil, err
+	}
+	if err = a.flushSettlement(ctx); err != nil {
+		restore(false)
+		return nil, err
+	}
+	return restore, nil
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
+	retirementErr := a.flushRetirement(ctx)
+	if err := a.flushSettlement(ctx); err != nil {
+		return err
+	}
 	hb := agentproto.Heartbeat{Version: a.Version, BinarySHA256: a.selfSHA, Epoch: a.epoch(), TS: time.Now().UTC(), Metrics: a.Metrics.Collect()}
 	hb.PublicIPv4, hb.PublicIPv6 = diag.PublicIPs()
-	hb.Ports = a.portCounters(ctx)
+	var meterErr error
+	hb.Ports, meterErr = a.portCounters(ctx)
+	if p := a.State.Retirement; p != nil {
+		pending := map[int64]bool{}
+		for _, n := range p.Nodes {
+			pending[n.NodeID] = true
+		}
+		kept := hb.Ports[:0]
+		for _, c := range hb.Ports {
+			if !pending[c.NodeID] {
+				kept = append(kept, c)
+			}
+		}
+		hb.Ports = kept
+	}
+	if meterErr != nil {
+		hb.Ports = nil
+	}
 	a.mu.Lock()
 	hb.AppliedRevision, hb.AppliedHash, hb.ApplyError = a.State.AppliedRevision, a.State.AppliedHash, a.State.ApplyError
-	if hb.ApplyError != "" {
+	if agentwork.Pending() {
+		hb.ApplyStatus = "pending"
+	} else if hb.ApplyError != "" {
 		hb.ApplyStatus = "failed"
 	} else if hb.AppliedRevision > 0 {
 		hb.ApplyStatus = "applied"
@@ -229,38 +428,71 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 	}
 	a.mu.Unlock()
 	hb.Diagnostics = a.diagnostics(ctx)
+	if retirementErr != nil {
+		hb.Diagnostics.MeteringError = "final meter settlement pending"
+	}
+	if meterErr != nil {
+		a.State.ApplyError = "node metering unavailable"
+		hb.ApplyError, hb.ApplyStatus = a.State.ApplyError, "failed"
+		hb.Diagnostics.MeteringError = meterErr.Error()
+	}
 
 	sent := time.Now()
 	resp, err := a.Client.Heartbeat(ctx, hb)
 	if err != nil {
 		return err
 	}
+	a.finalMeters = resp.FinalMeterVersion >= 1
 	if !resp.ServerTime.IsZero() {
 		rtt := time.Since(sent)
 		a.mu.Lock()
 		a.clockSkewMs = resp.ServerTime.Add(rtt / 2).Sub(time.Now()).Milliseconds()
 		a.mu.Unlock()
 	}
+	resp.PollIntervalSec = max(10, min(300, resp.PollIntervalSec))
 	if resp.PollIntervalSec > 0 && resp.PollIntervalSec != a.State.PollIntervalSec {
 		a.State.PollIntervalSec = resp.PollIntervalSec
 		_ = a.State.Save(a.StateDir)
 	}
+	if retirementErr != nil {
+		a.Logger.Warn("final settlement pending", "err", retirementErr)
+		return nil
+	}
 	if resp.Maintenance != nil {
+		if agentwork.Pending() {
+			return nil
+		}
 		return a.maintain(ctx, *resp.Maintenance)
 	}
 	if a.maintenanceAction() != "" {
 		return nil
 	}
-	if resp.AgentUpdate != nil && resp.AgentUpdate.SHA256 != "" && !strings.EqualFold(resp.AgentUpdate.SHA256, a.selfSHA) {
+	if !a.HoldUpdates && resp.AgentUpdate != nil && resp.AgentUpdate.SHA256 != "" && !strings.EqualFold(resp.AgentUpdate.SHA256, a.selfSHA) {
 		a.Logger.Info("self-update available", "sha", resp.AgentUpdate.SHA256[:min(12, len(resp.AgentUpdate.SHA256))])
 		if err := applySelfUpdate(ctx, a.State.ServerURL, *resp.AgentUpdate); err != nil {
-			a.Logger.Error("self-update failed", "err", err)
+			if !errors.Is(err, agentwork.ErrPending) {
+				a.Logger.Error("self-update failed", "err", err)
+			}
 		} else {
 			a.Logger.Info("self-update installed; exiting for systemd restart")
 			os.Exit(0)
 		}
 	}
-	if resp.DesiredRevision != a.State.AppliedRevision || resp.DesiredHash != a.State.AppliedHash || a.State.ApplyError != "" {
+	if pending, err := a.retirementPending(ctx); err != nil {
+		return err
+	} else if pending {
+		return nil
+	}
+	a.mu.Lock()
+	needInitialApply := a.desired == nil
+	currentDesired := a.desired
+	a.mu.Unlock()
+	if policy, err := secureupdate.LoadPolicy(); currentDesired != nil && err == nil && !policy.PauseConfig && secureupdate.Allow("agent.configure") == nil {
+		if err := a.NFT.EnsureIngress(ctx, currentDesired.Nodes); err != nil {
+			a.State.ApplyError = "节点端口开放失败: " + err.Error()
+		}
+	}
+	if needInitialApply || resp.DesiredRevision != a.State.AppliedRevision || resp.DesiredHash != a.State.AppliedHash || a.State.ApplyError != "" {
 		a.converge(ctx, false)
 	}
 	return nil
@@ -286,6 +518,14 @@ func (a *Agent) diagnostics(ctx context.Context) agentproto.Diagnostics {
 		OOMEvents: h.OOMEvents, Nftables: h.Nftables, Systemd: h.Systemd, TimeSync: h.TimeSync, Warnings: h.Warnings,
 		BinarySHA256: a.selfSHA,
 	}
+	d.SecurityVersion = 1
+	if policy, e := secureupdate.LoadPolicy(); e == nil {
+		if !policy.ChecksumOnly {
+			d.Warnings = append(append([]string(nil), d.Warnings...), secureupdate.TrustWarnings(secureupdate.StateDir, time.Now())...)
+		}
+		d.SecurityPolicy = true
+		d.SecurityPaused = policy.PauseConfig
+	}
 	if a.maintenanceSupported() {
 		d.Maintenance = 1
 	}
@@ -307,12 +547,25 @@ func (a *Agent) diagnostics(ctx context.Context) agentproto.Diagnostics {
 		d.RecentErrors = sb.RecentErrors(5)
 	}
 	pending, _ := a.Tail.Pending()
+	if a.PrivateTail != nil && (a.Tail.Queue == nil || a.PrivateTail.Queue != a.Tail.Queue) {
+		p, _ := a.PrivateTail.Pending()
+		pending += p
+	}
 	d.ConnlogLag = int64(pending)
 	return d
 }
 
 // converge fetches the desired state and applies it, reporting the result.
 func (a *Agent) converge(ctx context.Context, force bool) {
+	if a.maintenanceAction() != "" {
+		return
+	}
+	if pending, err := a.retirementPending(ctx); err != nil {
+		a.Logger.Warn("meter retirement", "err", err)
+		return
+	} else if pending {
+		return
+	}
 	a.mu.Lock()
 	if a.applying {
 		a.mu.Unlock()
@@ -326,27 +579,94 @@ func (a *Agent) converge(ctx context.Context, force bool) {
 		a.mu.Unlock()
 	}()
 
+	if p, e := secureupdate.LoadPolicy(); e != nil || p.PauseConfig {
+		a.Logger.Warn("本机安全策略未就绪或已暂停配置变更")
+		return
+	}
 	ds, err := a.Client.Desired(ctx)
 	if err != nil {
 		a.Logger.Warn("fetch desired state", "err", err)
 		return
 	}
+	if err := agentproto.ValidateDesired(ds, a.State.ServerID, a.State.AppliedRevision, a.State.AppliedHash); err != nil {
+		a.Logger.Warn("rejected desired state", "err", err)
+		return
+	}
+	policy, _ := secureupdate.LoadPolicy()
+	if e := secureupdate.Allow("agent.configure"); e != nil {
+		a.Logger.Warn("configuration not permitted by local policy")
+		return
+	}
+	maxNodes := policy.MaxNodes
+	if maxNodes <= 0 {
+		maxNodes = agentbudget.ActiveNodes
+	}
+	maxNodes = min(maxNodes, agentbudget.ActiveNodes)
+	maxMemory := policy.MaxMemoryMB
+	if maxMemory <= 0 {
+		maxMemory = 512
+	}
+	if len(ds.Nodes) > maxNodes || ds.Tuning.MemoryMaxMB > maxMemory || ds.Tuning.GoMemLimitMB > maxMemory {
+		a.Logger.Warn("configuration exceeds local resource policy")
+		return
+	}
+	for i := range ds.Nodes {
+		for _, id := range policy.PrivateNodes {
+			if ds.Nodes[i].NodeID == id {
+				ds.Nodes[i].AllowPrivate = true
+			}
+		}
+		c := ds.Nodes[i].Cert
+		if c != nil && c.Mode == "acme" {
+			allowed := policy.ChecksumOnly && len(policy.ACMEDomains) == 0
+			for _, domain := range policy.ACMEDomains {
+				if domain == c.Domain {
+					allowed = true
+				}
+			}
+			if !allowed {
+				a.Logger.Warn("ACME domain not locally authorized")
+				return
+			}
+		}
+		if c != nil && c.Mode == "external" {
+			p, e := secureupdate.LoadPolicy()
+			if e != nil {
+				a.Logger.Warn("external certificate policy unavailable")
+				return
+			}
+			cert, ok := p.Certificates[c.ID]
+			if !ok || c.ID == "" {
+				a.Logger.Warn("external certificate not registered")
+				return
+			}
+			c.CertPath, c.KeyPath = cert.Cert, cert.Key
+		}
+	}
 	a.mu.Lock()
-	a.desired = ds
+	hasDesired := a.desired != nil
 	a.mu.Unlock()
-	if !force && ds.Revision == a.State.AppliedRevision && ds.Hash == a.State.AppliedHash && a.State.ApplyError == "" {
+	if !force && hasDesired && ds.Revision == a.State.AppliedRevision && ds.Hash == a.State.AppliedHash && a.State.ApplyError == "" && proxyguard.Ready() == nil {
 		return
 	}
 	a.Logger.Info("applying desired state", "revision", ds.Revision, "nodes", len(ds.Nodes))
 	details, err := a.apply(ctx, ds)
 	rep := agentproto.ApplyReport{Revision: ds.Revision, Hash: ds.Hash, Status: "applied", Details: details}
-	a.State.AppliedRevision, a.State.AppliedHash = ds.Revision, ds.Hash
 	if err != nil {
 		rep.Status, rep.Error = "failed", err.Error()
+		if errors.Is(err, agentwork.ErrPending) {
+			rep.Status = "pending"
+		}
 		a.State.ApplyError = err.Error()
-		a.Logger.Error("apply failed", "revision", ds.Revision, "err", err)
+		if !errors.Is(err, agentwork.ErrPending) {
+			a.Logger.Error("apply failed", "revision", ds.Revision, "err", err)
+		}
 	} else {
+		a.State.AppliedRevision, a.State.AppliedHash = ds.Revision, ds.Hash
 		a.State.ApplyError = ""
+		a.mu.Lock()
+		a.desired = ds
+		a.mu.Unlock()
 		a.Logger.Info("applied", "revision", ds.Revision, "details", details)
 	}
 	_ = a.State.Save(a.StateDir)
@@ -362,6 +682,71 @@ func (a *Agent) apply(ctx context.Context, ds *agentproto.DesiredState) ([]strin
 	var errs []error
 	note := func(format string, args ...any) { details = append(details, fmt.Sprintf(format, args...)) }
 
+	// Persist meter identities before any process can start producing bytes.
+	if err := a.State.rememberMeters(ds.Nodes); err != nil {
+		return nil, err
+	}
+	if err := a.State.Save(a.StateDir); err != nil {
+		return details, err
+	}
+
+	restore, err := a.prepareMetering(ctx, ds)
+	if err != nil {
+		return details, err
+	}
+	success := false
+	defer func() { restore(success) }()
+	if !a.NFT.Available(ctx) {
+		return details, fmt.Errorf("nftables is required for shared-process node accounting")
+	}
+	if !a.NFT.NodesExist(ctx) {
+		a.State.CounterNonce = nonce()
+		if err := a.State.Save(a.StateDir); err != nil {
+			return details, err
+		}
+	}
+	meterNodes := append([]agentproto.NodeSpec(nil), ds.Nodes...)
+	current := map[int64]bool{}
+	for _, n := range ds.Nodes {
+		current[n.NodeID] = true
+	}
+	for _, n := range a.State.MeterNodes {
+		if n.Core == "singbox" && !current[n.NodeID] {
+			meterNodes = append(meterNodes, agentproto.NodeSpec{NodeID: n.NodeID, Core: n.Core, Blocked: true, Retired: true})
+		}
+	}
+	if err := a.NFT.EnsureNodes(ctx, meterNodes); err != nil {
+		return details, fmt.Errorf("node accounting: %w", err)
+	}
+
+	if err := a.Systemd.EnsureProxyBudget(ctx, ds.Tuning); err != nil {
+		return details, err
+	}
+
+	groups := map[int64]string{}
+	for _, n := range ds.Nodes {
+		if n.Core == "singbox" {
+			g, e := a.Systemd.EnsureSingBoxSlice(ctx, n.AllowPrivate)
+			if e != nil {
+				return details, e
+			}
+			groups[n.NodeID] = g
+		}
+		if n.Core == "snell" {
+			if _, e := a.Systemd.EnsureSnellMeter(ctx, n); e != nil {
+				return details, e
+			}
+			g, e := a.Systemd.ControlGroup(ctx, core.SnellSlice(n.NodeID))
+			if e != nil {
+				return details, e
+			}
+			groups[n.NodeID] = g
+		}
+	}
+	if e := a.NFT.EnsureEgress(ctx, ds.Nodes, groups); e != nil {
+		return details, fmt.Errorf("proxy egress protection unavailable: %w", e)
+	}
+
 	// host tuning
 	if ds.Tuning.EnableBBR {
 		if changed, err := diag.EnableBBR(ctx); err != nil {
@@ -376,10 +761,8 @@ func (a *Agent) apply(ctx context.Context, ds *agentproto.DesiredState) ([]strin
 
 	// group nodes per core
 	byCore := map[string][]agentproto.NodeSpec{}
-	var ports []int
 	for _, n := range ds.Nodes {
 		byCore[n.Core] = append(byCore[n.Core], n)
-		ports = append(ports, n.ListenPort) // count blocked ports too (keep history)
 	}
 	for name, drv := range a.Drivers {
 		nodes := byCore[name]
@@ -391,7 +774,12 @@ func (a *Agent) apply(ctx context.Context, ds *agentproto.DesiredState) ([]strin
 		}
 		if live > 0 {
 			key := map[string]string{"singbox": "sing-box", "snell": "snell-server"}[name]
-			if v, ok := ds.Versions[key]; ok {
+			v, ok := ds.Versions[key]
+			if !ok {
+				errs = append(errs, fmt.Errorf("missing trusted core version"))
+				continue
+			}
+			{
 				if changed, err := drv.EnsureInstalled(ctx, v); err != nil {
 					errs = append(errs, err)
 					note("%s: install failed: %v", name, err)
@@ -411,15 +799,24 @@ func (a *Agent) apply(ctx context.Context, ds *agentproto.DesiredState) ([]strin
 			note("%s: %d node(s) applied", name, live)
 		}
 	}
-	// nftables counters
-	if a.NFT.Available(ctx) {
-		if err := a.NFT.Ensure(ctx, ports); err != nil {
-			errs = append(errs, fmt.Errorf("nftables: %w", err))
-			note("nftables: %v", err)
+	if len(errs) == 0 {
+		if err := a.NFT.EnsureIngress(ctx, ds.Nodes); err != nil {
+			errs = append(errs, fmt.Errorf("节点端口开放失败: %w", err))
 		}
-	} else {
-		note("nftables unavailable: per-port accounting disabled")
 	}
+	if len(errs) == 0 && a.NFT.Exists(ctx) {
+		if err := a.NFT.Teardown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("remove settled legacy counters: %w", err))
+		}
+	}
+	if len(errs) == 0 {
+		a.State.MeteringV1 = true
+		if err := a.State.Save(a.StateDir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	success = len(errs) == 0
 	return details, errors.Join(errs...)
 }
 
@@ -444,24 +841,39 @@ func (a *Agent) connlogLoop(ctx context.Context) {
 		if batch <= 0 {
 			batch = 500
 		}
+		batch = min(batch, 500)
 		flush := time.Duration(ds.Connlog.FlushSec) * time.Second
 		if flush <= 0 {
 			flush = 30 * time.Second
 		}
 		pending, _ := a.Tail.Pending()
+		if a.PrivateTail != nil && (a.Tail.Queue == nil || a.PrivateTail.Queue != a.Tail.Queue) {
+			p, _ := a.PrivateTail.Pending()
+			pending += p
+		}
 		if pending == 0 || (pending < batch && time.Since(lastFlush) < flush) {
 			continue
 		}
-		events := a.Tail.Take(batch)
+		events := a.Tail.Take(max(1, batch/2))
+		if a.PrivateTail != nil && (a.Tail.Queue == nil || a.PrivateTail.Queue != a.Tail.Queue) && len(events) < batch {
+			events = append(events, a.PrivateTail.Take(batch-len(events))...)
+		}
+		if len(events) < batch {
+			events = append(events, a.Tail.Take(batch-len(events))...)
+		}
+		a.stateMu.Lock()
 		seq := a.State.ConnlogSeq + 1
+		a.stateMu.Unlock()
 		ack, err := a.Client.UploadConnlog(ctx, agentproto.ConnlogBatch{Seq: seq, Events: events})
 		if err != nil {
 			a.Tail.Requeue(events)
 			a.Logger.Warn("connlog upload failed", "err", err)
 			continue
 		}
+		a.stateMu.Lock()
 		a.State.ConnlogSeq = max(seq, ack.AcceptedSeq)
 		_ = a.State.Save(a.StateDir)
+		a.stateMu.Unlock()
 		lastFlush = time.Now()
 	}
 }
@@ -473,9 +885,13 @@ func (a *Agent) StatusSummary(ctx context.Context) string {
 	b += fmt.Sprintf("applied revision: %d  error: %q\n", a.State.AppliedRevision, a.State.ApplyError)
 	for _, drv := range a.Drivers {
 		st := drv.Status(ctx)
-		b += fmt.Sprintf("core %-13s installed=%v version=%s active=%v restarts=%d rss=%dMiB\n", st.Name, st.Installed, st.Version, st.Active, st.NRestarts, st.RSSBytes>>20)
+		b += fmt.Sprintf("core %-13s installed=%v version=%s active=%v restarts=%d cgroup-memory=%dMiB\n", st.Name, st.Installed, st.Version, st.Active, st.NRestarts, st.RSSBytes>>20)
 	}
-	for _, c := range a.portCounters(ctx) {
+	counters, err := a.portCounters(ctx)
+	if err != nil {
+		b += "metering unavailable: " + err.Error() + "\n"
+	}
+	for _, c := range counters {
 		b += fmt.Sprintf("port %-6d rx=%d tx=%d\n", c.Port, c.Rx, c.Tx)
 	}
 	return b

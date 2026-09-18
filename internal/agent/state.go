@@ -3,6 +3,8 @@
 package agent
 
 import (
+	"ctlvps/internal/agentproto"
+	"ctlvps/internal/safehttp"
 	"encoding/json"
 	"errors"
 	"os"
@@ -11,7 +13,20 @@ import (
 )
 
 // State is persisted in <stateDir>/state.json.
+type MeterIdentity struct {
+	Generation string `json:"generation,omitempty"`
+	NodeID     int64  `json:"node_id"`
+	Port       int    `json:"port"`
+	Core       string `json:"core"`
+}
+
 type State struct {
+	Retirement        *Retirement           `json:"retirement,omitempty"`
+	LegacySettled     bool                  `json:"legacy_settled,omitempty"`
+	PendingSettlement *agentproto.Heartbeat `json:"pending_settlement,omitempty"`
+	MeterNodes        []MeterIdentity       `json:"meter_nodes,omitempty"`
+
+	MeteringV1      bool      `json:"metering_v1,omitempty"`
 	ServerURL       string    `json:"server_url"`
 	AgentToken      string    `json:"agent_token"`
 	ServerID        int64     `json:"server_id"`
@@ -30,8 +45,16 @@ func StatePath(dir string) string { return filepath.Join(dir, "state.json") }
 
 // LoadState reads the state file.
 func LoadState(dir string) (*State, error) {
-	b, err := os.ReadFile(StatePath(dir))
+	f, err := os.Open(StatePath(dir))
 	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := safehttp.ReadBounded(f, 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	if err = safehttp.CheckJSONBudget(b); err != nil {
 		return nil, err
 	}
 	var s State
@@ -54,8 +77,50 @@ func (s *State) Save(dir string) error {
 		return err
 	}
 	tmp := StatePath(dir) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, StatePath(dir))
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err = os.Rename(tmp, StatePath(dir)); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// Retained identities include unsettled retired nodes. Never discard them to
+// satisfy a budget: block new identities until safe settlement is available.
+const maxMeterIdentities = 2048
+
+func (s *State) rememberMeters(nodes []agentproto.NodeSpec) error {
+	known := make(map[int64]bool, len(s.MeterNodes))
+	for _, n := range s.MeterNodes {
+		known[n.NodeID] = true
+	}
+	additions := []MeterIdentity{}
+	for _, n := range nodes {
+		if !known[n.NodeID] {
+			known[n.NodeID] = true
+			additions = append(additions, MeterIdentity{NodeID: n.NodeID, Port: n.ListenPort, Core: n.Core, Generation: nonce()})
+		}
+	}
+	if len(additions) > 0 && len(s.MeterNodes)+len(additions) > maxMeterIdentities {
+		return errors.New("retained meter identity budget exhausted; settle retired nodes before adding new identities")
+	}
+	s.MeterNodes = append(s.MeterNodes, additions...)
+	return nil
 }

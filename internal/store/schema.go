@@ -324,4 +324,51 @@ CREATE TABLE maintenance_jobs (
 );
 CREATE UNIQUE INDEX idx_maintenance_active ON maintenance_jobs(server_id) WHERE status IN ('queued','running');
 `,
+	// v7: credential-free accounting identities outlive node deletion so final
+	// agent reports still reach the original node and share ledgers.
+	`
+CREATE TABLE node_meter_identities (
+ node_id INTEGER PRIMARY KEY,
+ server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+ listen_port INTEGER NOT NULL,
+ core TEXT NOT NULL,
+ share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL
+);
+INSERT INTO node_meter_identities SELECT id,server_id,listen_port,core,share_id FROM nodes WHERE server_id IS NOT NULL;
+CREATE TRIGGER node_meter_insert AFTER INSERT ON nodes WHEN NEW.server_id IS NOT NULL BEGIN
+ INSERT OR REPLACE INTO node_meter_identities VALUES(NEW.id,NEW.server_id,NEW.listen_port,NEW.core,NEW.share_id);
+END;
+CREATE TRIGGER node_meter_update AFTER UPDATE ON nodes WHEN NEW.server_id IS NOT NULL BEGIN
+ INSERT OR REPLACE INTO node_meter_identities VALUES(NEW.id,NEW.server_id,NEW.listen_port,NEW.core,NEW.share_id);
+END;
+`,
+	`ALTER TABLE subscriptions ADD COLUMN short_code_hash TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_sub_short_hash ON subscriptions(short_code_hash);`,
+	`ALTER TABLE users ADD COLUMN security_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN security_version INTEGER NOT NULL DEFAULT 0;`,
+	// Final snapshot acknowledgments commit with usage, never before it.
+	`CREATE TABLE meter_settlements (
+ server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+ batch_id TEXT NOT NULL,
+ created_at TEXT NOT NULL,
+ PRIMARY KEY(server_id,batch_id)
+ );`,
+	// Completed uninstall receipts must survive server deletion for callback retries.
+	`CREATE TABLE maintenance_jobs_new (
+ id TEXT PRIMARY KEY,
+ server_id INTEGER NOT NULL,
+ request TEXT NOT NULL,
+ status TEXT NOT NULL,
+ result TEXT NOT NULL,
+ report_token TEXT NOT NULL,
+ report_hash TEXT NOT NULL,
+ agent_sha TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ delete_server INTEGER NOT NULL DEFAULT 0
+ );
+ INSERT INTO maintenance_jobs_new SELECT *,0 FROM maintenance_jobs;
+ DROP TABLE maintenance_jobs;
+ ALTER TABLE maintenance_jobs_new RENAME TO maintenance_jobs;
+ CREATE UNIQUE INDEX idx_maintenance_active ON maintenance_jobs(server_id) WHERE status IN ('queued','running');`,
 }

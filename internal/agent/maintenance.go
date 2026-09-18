@@ -15,7 +15,7 @@ import (
 
 func (a *Agent) maintenanceSupported() bool {
 	u, err := url.Parse(a.State.ServerURL)
-	return maintenance.Supported() && a.StateDir == "/var/lib/ctlvps-agent" && executablePath() == "/usr/local/bin/ctlvps-agent" && err == nil && u.Scheme == "https" && u.User == nil
+	return !a.HoldUpdates && maintenance.Supported() && a.StateDir == "/var/lib/ctlvps-agent" && executablePath() == "/usr/local/bin/ctlvps-agent" && err == nil && u.Scheme == "https" && u.User == nil
 }
 
 func (a *Agent) maintain(ctx context.Context, c agentproto.MaintenanceCommand) error {
@@ -63,10 +63,9 @@ func (a *Agent) maintenanceAction() string {
 	}
 	m := maintenance.NewManager()
 	m.Recover()
-	for _, j := range m.List() {
-		if j.Role == "agent" && j.Active() {
-			return j.Action
-		}
+	action, err := m.ActiveAction("agent")
+	if err != nil {
+		return "pending"
 	}
-	return ""
+	return action
 }
